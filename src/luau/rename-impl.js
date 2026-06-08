@@ -51,67 +51,53 @@ const BUILTIN_LIBS = new Set([
 const FIRST_CHARS = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
 const REST_CHARS = `${FIRST_CHARS}0123456789`;
 
-function shuffleChars(chars, rng) {
-  const list = chars.split("");
-  if (rng) {
-    rng.shuffle(list);
+function countNamesOfLength(length, firstAlphabet, restAlphabet) {
+  if (length <= 1) {
+    return firstAlphabet.length;
   }
-  return list.join("");
+  return firstAlphabet.length * (restAlphabet.length ** (length - 1));
 }
 
-function hash32(value) {
-  let x = value >>> 0;
-  x ^= x >>> 16;
-  x = Math.imul(x, 0x7feb352d) >>> 0;
-  x ^= x >>> 15;
-  x = Math.imul(x, 0x846ca68b) >>> 0;
-  x ^= x >>> 16;
-  return x >>> 0;
-}
-
-function encodeBase(value, alphabet, minLen) {
-  const base = alphabet.length;
-  let v = value >>> 0;
-  let out = "";
-  do {
-    out = alphabet[v % base] + out;
-    v = Math.floor(v / base);
-  } while (v > 0);
-  if (minLen && out.length < minLen) {
-    let pad = value >>> 0;
-    while (out.length < minLen) {
-      pad = Math.imul(pad ^ 0x5bd1e995, 0x27d4eb2d) >>> 0;
-      out = alphabet[pad % base] + out;
-    }
+function nameAtLengthIndex(length, index, firstAlphabet, restAlphabet) {
+  if (length <= 1) {
+    return firstAlphabet[index % firstAlphabet.length];
   }
-  return out;
+  let restIndex = index % (restAlphabet.length ** (length - 1));
+  const firstIndex = Math.floor(index / (restAlphabet.length ** (length - 1))) % firstAlphabet.length;
+  let name = firstAlphabet[firstIndex];
+  const chars = new Array(length - 1);
+  for (let pos = chars.length - 1; pos >= 0; pos -= 1) {
+    chars[pos] = restAlphabet[restIndex % restAlphabet.length];
+    restIndex = Math.floor(restIndex / restAlphabet.length);
+  }
+  return name + chars.join("");
 }
 
 class LuaNameGenerator {
-  constructor({ rng, reserved = [], alphabets = null } = {}) {
-    this.rng = rng;
+  constructor({ reserved = [], alphabets = null } = {}) {
     this.reserved = new Set(reserved);
     this.used = new Set();
     this.index = 0;
+    this.length = 1;
     if (alphabets && alphabets.first && alphabets.rest) {
       this.firstAlphabet = alphabets.first;
       this.restAlphabet = alphabets.rest;
     } else {
-      this.firstAlphabet = shuffleChars(FIRST_CHARS, rng);
-      this.restAlphabet = shuffleChars(REST_CHARS, rng);
+      this.firstAlphabet = FIRST_CHARS;
+      this.restAlphabet = REST_CHARS;
     }
-    this.salt = rng ? rng.int(0, 0x7fffffff) : 0x9e3779b9;
   }
 
   next() {
     while (true) {
-      const currentIndex = this.index;
+      const count = countNamesOfLength(this.length, this.firstAlphabet, this.restAlphabet);
+      if (this.index >= count) {
+        this.length += 1;
+        this.index = 0;
+        continue;
+      }
+      const name = nameAtLengthIndex(this.length, this.index, this.firstAlphabet, this.restAlphabet);
       this.index += 1;
-      const mixed = hash32(currentIndex + this.salt);
-      const first = this.firstAlphabet[mixed % this.firstAlphabet.length];
-      const minLen = 2 + (mixed % 3);
-      const body = encodeBase(hash32(mixed ^ 0x9e3779b9), this.restAlphabet, minLen);
-      const name = `${first}${body}`;
       if (!this.reserved.has(name) && !this.used.has(name)) {
         this.used.add(name);
         return name;
@@ -296,7 +282,10 @@ function isDynamicKeyMapAccess(expr, scope, ctx) {
 }
 
 function defineName(scope, name, ctx) {
-  if (ctx.reserved.has(name)) {
+  if (
+    ctx.reserved.has(name) ||
+    (scope && scope.isRoot && ctx.topReturnExportNames && ctx.topReturnExportNames.has(name))
+  ) {
     scope.bindings.set(name, name);
     return name;
   }
@@ -310,7 +299,7 @@ function defineName(scope, name, ctx) {
 }
 
 function defineGlobal(name, ctx) {
-  if (ctx.reserved.has(name)) {
+  if (ctx.reserved.has(name) || (ctx.topReturnExportNames && ctx.topReturnExportNames.has(name))) {
     ctx.globals.set(name, name);
     return name;
   }
@@ -345,6 +334,54 @@ function defineMember(name, ctx) {
 
 function getIdentifierName(node) {
   return node && node.type === "Identifier" && typeof node.name === "string" ? node.name : null;
+}
+
+function getDirectReturnExportName(expr) {
+  let current = expr;
+  while (current && current.type === "GroupExpression") {
+    current = current.expression;
+  }
+  if (!current || typeof current !== "object") {
+    return null;
+  }
+  if (current.type === "Identifier") {
+    return getIdentifierName(current);
+  }
+  if (current.type === "CallExpression") {
+    let base = current.base;
+    while (base && base.type === "GroupExpression") {
+      base = base.expression;
+    }
+    return base && base.type === "Identifier" ? getIdentifierName(base) : null;
+  }
+  return null;
+}
+
+function collectTopReturnExportNames(ast) {
+  const names = new Set();
+  const marked = ast && ast.__obf_top_return_export_names;
+  if (marked && typeof marked.forEach === "function") {
+    marked.forEach((name) => {
+      if (typeof name === "string" && name) {
+        names.add(name);
+      }
+    });
+  }
+  if (!ast || !Array.isArray(ast.body)) {
+    return names;
+  }
+  ast.body.forEach((stmt) => {
+    if (!stmt || stmt.type !== "ReturnStatement" || !Array.isArray(stmt.arguments)) {
+      return;
+    }
+    stmt.arguments.forEach((expr) => {
+      const name = getDirectReturnExportName(expr);
+      if (name) {
+        names.add(name);
+      }
+    });
+  });
+  return names;
 }
 
 function getMemberPath(expr) {
@@ -2310,7 +2347,13 @@ function renameIfStatement(stmt, scope, ctx) {
 
 function renameLuau(ast, ctx) {
   const userReserved = ctx.options.renameOptions?.reserved || [];
-  const reserved = new Set([...LUA_KEYWORDS, ...LUA_RESERVED_GLOBALS, ...userReserved]);
+  const preserveTopReturnNames = ctx.options.renameOptions?.preserveTopReturnNames !== false;
+  const topReturnExportNames = preserveTopReturnNames ? collectTopReturnExportNames(ast) : new Set();
+  const reserved = new Set([
+    ...LUA_KEYWORDS,
+    ...LUA_RESERVED_GLOBALS,
+    ...userReserved,
+  ]);
   const used = collectIdentifiers(ast);
   const readNames =
     ctx && typeof ctx.getSSA === "function"
@@ -2377,9 +2420,11 @@ function renameLuau(ast, ctx) {
     safeFunctionParameterHints,
     readNames,
     envAliasName,
+    topReturnExportNames,
     debugTrace: ctx.debugTrace,
   };
   const rootScope = createScope(null);
+  rootScope.isRoot = true;
   if (Array.isArray(ast.body)) {
     renameStatementList(ast.body, rootScope, state);
   }

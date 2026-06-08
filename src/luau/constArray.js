@@ -1,6 +1,6 @@
 const { walk, traverse } = require("./ast");
 const { decodeRawString } = require("./strings");
-const { collectIdentifierNames, makeNameFactory } = require("./names");
+const { collectIdentifierNames, makeShortNameFactory } = require("./names");
 const { addSSAReadNames, findSSAForNode, getCachedSSAReadNamesFromRoot, getCachedSSAUsedNamesFromRoot } = require("./ssa-utils");
 
 function luaString(value) {
@@ -337,7 +337,7 @@ function constantArrayLuau(ast, ctx) {
   if (scopeRoot) {
     collectScopeMap(scopeRoot, scopeMap);
   }
-  const nameFor = makeNameFactory(ctx.rng, used);
+  const nameFor = makeShortNameFactory(ctx.rng, used);
   const scopes = perScope ? collectScopes(ast) : [{ node: ast, body: getScopeBody(ast) }];
 
   scopes.forEach(({ node, body }) => {

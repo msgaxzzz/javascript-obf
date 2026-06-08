@@ -127,6 +127,12 @@ function toOfficialNode(node) {
     case "DeclareFunctionStatement":
       out.type = "StatDeclareFunction";
       return out;
+    case "DeclareVariableStatement":
+      out.type = "StatDeclareGlobal";
+      return out;
+    case "DeclareExternTypeStatement":
+      out.type = "StatDeclareExternType";
+      return out;
     case "IfExpression":
       out.type = "ExprIfElse";
       out.condition = node.clauses && node.clauses[0] ? toOfficialNode(node.clauses[0].condition) : null;
@@ -187,6 +193,12 @@ function toLegacyNode(node) {
       return out;
     case "StatDeclareFunction":
       out.type = "DeclareFunctionStatement";
+      return out;
+    case "StatDeclareGlobal":
+      out.type = "DeclareVariableStatement";
+      return out;
+    case "StatDeclareExternType":
+      out.type = "DeclareExternTypeStatement";
       return out;
     case "ExprIfElse":
       out.type = "IfExpression";

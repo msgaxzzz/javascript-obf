@@ -72,6 +72,44 @@ const PRESETS = {
   },
 };
 
+const JS_SCHEMES = {
+  classic: {
+    stringMinLength: 3,
+    stringSampleRate: 1,
+    stringSegmentSize: null,
+    deadProbability: 0.15,
+    vm: null,
+  },
+  stealth: {
+    stringMinLength: 2,
+    stringSampleRate: 0.92,
+    stringSegmentSize: 96,
+    deadProbability: 0.1,
+    vm: null,
+  },
+  runtime: {
+    stringMinLength: 2,
+    stringSampleRate: 0.95,
+    stringSegmentSize: 80,
+    deadProbability: 0.12,
+    vm: {
+      enabled: true,
+      downlevel: true,
+      fakeOpcodes: 0.2,
+      bytecodeEncrypt: true,
+      constsEncrypt: true,
+    },
+  },
+};
+
+function normalizeJsScheme(value) {
+  if (value === undefined || value === null || value === "") {
+    return "classic";
+  }
+  const text = String(value).trim().toLowerCase();
+  return JS_SCHEMES[text] ? text : "classic";
+}
+
 function normalizeOptions(userOptions = {}) {
   const requestedPreset = String(userOptions.preset ?? "high").toLowerCase();
   const presetName = PRESETS[requestedPreset] ? requestedPreset : "high";
@@ -90,15 +128,22 @@ function normalizeOptions(userOptions = {}) {
   const antiHookUserOptions = userOptions.antiHook;
   const ecma = normalizeEcma(userOptions.ecma);
   const lang = String(userOptions.lang ?? "js").toLowerCase();
+  const schemeName = lang === "luau"
+    ? "classic"
+    : normalizeJsScheme(userOptions.scheme ?? userOptions.jsScheme);
+  const scheme = JS_SCHEMES[schemeName] || JS_SCHEMES.classic;
   const defaultCffMode = lang === "luau" ? "classic" : null;
-  const cffMode = cffModeRaw === "vm" || cffModeRaw === "classic"
+  const cffMode = cffModeRaw === "vm" || cffModeRaw === "classic" || cffModeRaw === "woven"
     ? cffModeRaw
     : null;
   const effectiveCffMode = cffMode || defaultCffMode;
   const luauStyle = "default";
   const luauParser = "custom";
   const maxCount = normalizeCount(stringsUserOptions.maxCount, 5000, { min: 0 });
-  const segmentDefault = lang === "luau" ? Math.min(maxCount, 120) : maxCount;
+  const jsSegmentDefault = scheme.stringSegmentSize
+    ? Math.min(maxCount, scheme.stringSegmentSize)
+    : maxCount;
+  const segmentDefault = lang === "luau" ? Math.min(maxCount, 120) : jsSegmentDefault;
   const segmentSize = normalizeCount(
     stringsUserOptions.segmentSize,
     segmentDefault,
@@ -137,16 +182,30 @@ function normalizeOptions(userOptions = {}) {
   const compactDefault = lang === "luau"
     ? (userOptions.compact ?? true)
     : Boolean(userOptions.compact);
-  const defaultStringMinLength = lang === "luau" ? 1 : 3;
+  const defaultStringMinLength = lang === "luau" ? 1 : scheme.stringMinLength;
+  const schemeVmDefaults = lang === "js" && scheme.vm ? scheme.vm : null;
+  const hasUserVm = hasOwn(userOptions, "vm") && userOptions.vm !== undefined;
+  let vmInput = hasUserVm
+    ? userOptions.vm
+    : (schemeVmDefaults || { enabled: preset.vm });
+  if (
+    schemeVmDefaults &&
+    vmInput &&
+    typeof vmInput === "object" &&
+    !Array.isArray(vmInput)
+  ) {
+    vmInput = { ...schemeVmDefaults, ...vmInput };
+  }
   const options = {
     preset: presetName,
+    scheme: schemeName,
     lang: lang === "luau" ? "luau" : "js",
     luauParser: "custom",
     rename: userOptions.rename ?? preset.rename,
     strings: userOptions.strings ?? preset.strings,
     cff: userOptions.cff ?? preset.cff,
     dead: userOptions.dead ?? preset.dead,
-    vm: userOptions.vm ?? { enabled: preset.vm },
+    vm: vmInput,
     wrap: userOptions.wrap ?? wrapUserOptions.enabled ?? false,
     wrapOptions: {
       iterations: wrapIterations,
@@ -191,7 +250,7 @@ function normalizeOptions(userOptions = {}) {
       minLength: stringsUserOptions.minLength ?? defaultStringMinLength,
       maxCount,
       segmentSize,
-      sampleRate: normalizeProbability(stringsUserOptions.sampleRate, 1),
+      sampleRate: normalizeProbability(stringsUserOptions.sampleRate, scheme.stringSampleRate),
       split: Boolean(stringsUserOptions.split),
       splitMin,
       splitMaxParts,
@@ -208,15 +267,20 @@ function normalizeOptions(userOptions = {}) {
       renameMembers: renameUserOptions.renameMembers ?? userOptions.renameMembers ?? false,
       homoglyphs: renameUserOptions.homoglyphs ?? userOptions.homoglyphs ?? false,
       maskGlobals: renameUserOptions.maskGlobals ?? userOptions.maskGlobals ?? (lang === "luau"),
+      preserveTopReturnNames: renameUserOptions.preserveTopReturnNames ?? userOptions.preserveTopReturnNames ?? true,
     },
     deadCodeOptions: {
-      probability: 0.15,
+      probability: normalizeProbability(
+        userOptions.deadCodeOptions && userOptions.deadCodeOptions.probability,
+        scheme.deadProbability
+      ),
     },
     cffOptions: {
       minStatements: 3,
       downlevel: cffUserOptions.downlevel ?? Boolean(userOptions.cffDownlevel),
       mode: effectiveCffMode,
       opaque: cffUserOptions.opaque !== false,
+      hideTopReturnExpr: Boolean(cffUserOptions.hideTopReturnExpr ?? userOptions.cffHideTopReturnExpr),
     },
     antiHook: {
       enabled: false,
@@ -399,6 +463,7 @@ function normalizeOptions(userOptions = {}) {
       ? vmModeDefaults.dynamicCoupling
       : Boolean(vmDynamicCoupling),
     downlevel: Boolean(vmOptions.downlevel),
+    sandbox: vmOptions.sandbox !== false,
     debug: Boolean(vmOptions.debug),
   };
 

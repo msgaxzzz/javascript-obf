@@ -12,6 +12,165 @@ function isCallLikeExpression(expr) {
   );
 }
 
+function isMultiReturnExpression(expr) {
+  return Boolean(expr && (expr.type === "VarargLiteral" || isCallLikeExpression(expr)));
+}
+
+function isFunctionNode(node) {
+  return Boolean(node && (node.type === "FunctionDeclaration" || node.type === "FunctionExpression"));
+}
+
+function isReferenceIdentifier(node, parent, key) {
+  if (!node || node.type !== "Identifier" || !parent) {
+    return true;
+  }
+  if ((parent.type === "FunctionDeclaration" || parent.type === "FunctionExpression") && key === "parameters") {
+    return false;
+  }
+  if (parent.type === "FunctionName") {
+    return false;
+  }
+  if (parent.type === "LocalStatement" && key === "variables") {
+    return false;
+  }
+  if (parent.type === "ForNumericStatement" && key === "variable") {
+    return false;
+  }
+  if (parent.type === "ForGenericStatement" && key === "variables") {
+    return false;
+  }
+  if (parent.type === "MemberExpression" && key === "identifier") {
+    return false;
+  }
+  if (parent.type === "TableField" && key === "name") {
+    return false;
+  }
+  return true;
+}
+
+function walkOwnedFunctionNodes(root, visitor, parent = null, key = null) {
+  if (!root || typeof root !== "object") {
+    return;
+  }
+  if (Array.isArray(root)) {
+    root.forEach((item, index) => walkOwnedFunctionNodes(item, visitor, parent, key || index));
+    return;
+  }
+  visitor(root, parent, key);
+  if (root !== parent && isFunctionNode(root) && root !== visitor.root) {
+    return;
+  }
+  Object.keys(root).forEach((childKey) => {
+    walkOwnedFunctionNodes(root[childKey], visitor, root, childKey);
+  });
+}
+
+function collectDeclaredNamesInFunction(fnNode) {
+  const names = new Set();
+  const params = Array.isArray(fnNode && fnNode.parameters) ? fnNode.parameters : [];
+  params.forEach((param) => {
+    if (param && param.type === "Identifier" && param.name) {
+      names.add(param.name);
+    }
+  });
+  const visitor = (node, parent, key) => {
+    if (!node || typeof node !== "object" || node === fnNode) {
+      return;
+    }
+    if (node.type === "LocalStatement" && Array.isArray(node.variables)) {
+      node.variables.forEach((variable) => {
+        if (variable && variable.type === "Identifier" && variable.name) {
+          names.add(variable.name);
+        }
+      });
+      return;
+    }
+    if (node.type === "FunctionDeclaration" && node.isLocal && node.name && node.name.base && node.name.base.name) {
+      names.add(node.name.base.name);
+      return;
+    }
+    if (node.type === "ForNumericStatement" && node.variable && node.variable.name) {
+      names.add(node.variable.name);
+      return;
+    }
+    if (node.type === "ForGenericStatement" && Array.isArray(node.variables)) {
+      node.variables.forEach((variable) => {
+        if (variable && variable.type === "Identifier" && variable.name) {
+          names.add(variable.name);
+        }
+      });
+    }
+  };
+  visitor.root = fnNode;
+  walkOwnedFunctionNodes(fnNode, visitor);
+  return names;
+}
+
+function collectUsedIdentifierOrderInFunction(fnNode) {
+  const names = [];
+  const seen = new Set();
+  const visitor = (node, parent, key) => {
+    if (!node || node.type !== "Identifier" || !node.name) {
+      return;
+    }
+    if (!isReferenceIdentifier(node, parent, key)) {
+      return;
+    }
+    if (seen.has(node.name)) {
+      return;
+    }
+    seen.add(node.name);
+    names.push(node.name);
+  };
+  visitor.root = fnNode;
+  walkOwnedFunctionNodes(fnNode, visitor);
+  return names;
+}
+
+function appendUniqueName(names, seen, name) {
+  if (!name || seen.has(name)) {
+    return;
+  }
+  seen.add(name);
+  names.push(name);
+}
+
+function collectFreeIdentifierOrderInFunction(fnNode) {
+  const declared = collectDeclaredNamesInFunction(fnNode);
+  const names = [];
+  const seen = new Set();
+
+  const visit = (node, parent = null, key = null) => {
+    if (!node || typeof node !== "object") {
+      return;
+    }
+    if (Array.isArray(node)) {
+      node.forEach((item) => visit(item, parent, key));
+      return;
+    }
+    if (node !== fnNode && isFunctionNode(node)) {
+      collectFreeIdentifierOrderInFunction(node).forEach((name) => {
+        if (!declared.has(name)) {
+          appendUniqueName(names, seen, name);
+        }
+      });
+      return;
+    }
+    if (node.type === "Identifier" && node.name && isReferenceIdentifier(node, parent, key)) {
+      if (!declared.has(node.name)) {
+        appendUniqueName(names, seen, node.name);
+      }
+      return;
+    }
+    Object.keys(node).forEach((childKey) => {
+      visit(node[childKey], node, childKey);
+    });
+  };
+
+  visit(fnNode);
+  return names;
+}
+
 function raise(message, node = null) {
   throw makeDiagnosticErrorFromNode(message, node);
 }
@@ -59,11 +218,11 @@ class Scope {
     this.bindings = new Map();
   }
 
-  define(name, index) {
-    this.bindings.set(name, index);
+  define(name, index, meta = null) {
+    this.bindings.set(name, { index, meta: meta || {} });
   }
 
-  resolve(name) {
+  resolveBinding(name) {
     let current = this;
     while (current) {
       if (current.bindings.has(name)) {
@@ -72,6 +231,11 @@ class Scope {
       current = current.parent;
     }
     return null;
+  }
+
+  resolve(name) {
+    const binding = this.resolveBinding(name);
+    return binding ? binding.index : null;
   }
 }
 
@@ -87,6 +251,8 @@ class VmCompiler {
     this.loopStack = [];
     this.tempCount = 0;
     this.userLabelNames = new Map();
+    this.functionHasVararg = false;
+    this.closures = [];
   }
 
   nextTemp() {
@@ -115,14 +281,18 @@ class VmCompiler {
     return idx;
   }
 
-  defineLocal(name) {
+  defineLocal(name, meta = null) {
     this.localCount += 1;
-    this.scope.define(name, this.localCount);
+    this.scope.define(name, this.localCount, meta);
     return this.localCount;
   }
 
   resolveLocal(name) {
     return this.scope.resolve(name);
+  }
+
+  resolveBinding(name) {
+    return this.scope.resolveBinding(name);
   }
 
   enterScope() {
@@ -166,15 +336,38 @@ class VmCompiler {
     return name;
   }
 
+  normalizePreboundLocal(entry) {
+    if (typeof entry === "string") {
+      return { name: entry, init: entry, set: entry };
+    }
+    if (entry && typeof entry.name === "string") {
+      return {
+        name: entry.name,
+        init: entry.init !== undefined ? entry.init : entry.name,
+        set: entry.set !== undefined ? entry.set : entry.name,
+      };
+    }
+    return null;
+  }
+
   compileFunction(node, extraPreboundLocals = []) {
     const params = this.getFunctionParams(node);
-    const preboundLocals = Array.from(new Set([
+    const preboundMap = new Map();
+    [
       ...extraPreboundLocals,
       ...this.getFunctionPreboundLocals(node),
-    ]));
+    ].forEach((entry) => {
+      const normalized = this.normalizePreboundLocal(entry);
+      if (normalized && !preboundMap.has(normalized.name)) {
+        preboundMap.set(normalized.name, normalized);
+      }
+    });
+    const preboundLocals = Array.from(preboundMap.values());
+    const previousHasVararg = this.functionHasVararg;
+    this.functionHasVararg = Boolean(node && node.hasVararg);
     this.enterScope();
-    preboundLocals.forEach((name) => {
-      this.defineLocal(name);
+    preboundLocals.forEach((entry) => {
+      this.defineLocal(entry.name, { prebound: true });
     });
     this.enterScope();
     params.forEach((param) => {
@@ -190,13 +383,17 @@ class VmCompiler {
     this.emitter.patch();
     this.exitScope();
     this.exitScope();
+    this.functionHasVararg = previousHasVararg;
     return {
       instructions: this.emitter.instructions,
       consts: this.consts,
+      closures: this.closures,
       localCount: this.localCount,
       paramCount: params.length,
       paramNames: params,
-      localInitValues: [...preboundLocals, ...params],
+      localInitValues: [...preboundLocals.map((entry) => entry.init), ...params],
+      localSetTargets: [...preboundLocals.map((entry) => entry.set), ...params],
+      hasVararg: Boolean(node && node.hasVararg),
     };
   }
 
@@ -214,17 +411,23 @@ class VmCompiler {
     locals.forEach((name) => {
       this.defineLocal(name);
     });
+    const previousHasVararg = this.functionHasVararg;
+    this.functionHasVararg = false;
     this.compileStatements(body);
     this.emit("RETURN", 0, 0);
     this.emitter.patch();
     this.exitScope();
+    this.functionHasVararg = previousHasVararg;
     return {
       instructions: this.emitter.instructions,
       consts: this.consts,
+      closures: this.closures,
       localCount: this.localCount,
       paramCount: locals.length,
       paramNames: locals,
       localInitValues: locals,
+      localSetTargets: locals,
+      hasVararg: false,
     };
   }
 
@@ -305,6 +508,9 @@ class VmCompiler {
       case "CallStatement":
         this.compileCallStatement(stmt);
         return;
+      case "FunctionDeclaration":
+        this.compileFunctionDeclaration(stmt);
+        return;
       case "ReturnStatement":
         this.compileReturnStatement(stmt);
         return;
@@ -344,6 +550,9 @@ class VmCompiler {
       case "ExportTypeStatement":
       case "TypeFunctionStatement":
       case "ExportTypeFunctionStatement":
+      case "DeclareFunctionStatement":
+      case "DeclareVariableStatement":
+      case "DeclareExternTypeStatement":
         return;
       default:
         raise(`Unsupported statement ${stmt.type}`, stmt);
@@ -375,7 +584,7 @@ class VmCompiler {
       }
       const name = variables[0] ? variables[0].name : null;
       const localIdx = name ? this.defineLocal(name) : this.nextTemp();
-      this.emit("SET_LOCAL", localIdx, 0);
+      this.emit("DECLARE_LOCAL", localIdx, 0);
       return;
     }
     this.compileMultiAssign(variables, init, true);
@@ -412,7 +621,7 @@ class VmCompiler {
       const expr = init[idx];
       const isLast = idx === init.length - 1;
       const remaining = variables.length - writeIndex;
-      if (expr && isLast && remaining > 1 && isCallLikeExpression(expr)) {
+      if (expr && isLast && remaining > 1 && isMultiReturnExpression(expr)) {
         const resultTemps = Array.from({ length: remaining }, () => this.nextTemp());
         this.compileValueExpression(expr, remaining);
         for (let j = remaining - 1; j >= 0; j -= 1) {
@@ -443,7 +652,7 @@ class VmCompiler {
       const prepared = preparedTargets[idx];
       if (isLocal && prepared && prepared.type === "Identifier") {
         const localIdx = this.defineLocal(prepared.name);
-        this.emit("SET_LOCAL", localIdx, 0);
+        this.emit("DECLARE_LOCAL", localIdx, 0);
       } else {
         this.compilePreparedAssignTarget(prepared);
       }
@@ -523,9 +732,14 @@ class VmCompiler {
       return;
     }
     const tailExpr = args[args.length - 1];
-    if (isCallLikeExpression(tailExpr)) {
+    if (isMultiReturnExpression(tailExpr)) {
       for (let i = 0; i < args.length - 1; i += 1) {
         this.compileValueExpression(args[i], 1);
+      }
+      if (tailExpr.type === "VarargLiteral") {
+        this.compileVarargPack(tailExpr);
+        this.emit("RETURN_VARARGS", args.length - 1, 0);
+        return;
       }
       if (this.callHasExpandedTail(tailExpr)) {
         this.emitExpandedReturnCall(tailExpr, args.length - 1);
@@ -645,12 +859,13 @@ class VmCompiler {
 
     this.enterScope();
     const varName = stmt.variable ? stmt.variable.name : null;
-    const varIdx = varName ? this.defineLocal(varName) : this.nextTemp();
+    const varIdx = varName ? this.defineLocal(varName, { loopVariable: true }) : this.nextTemp();
+    const controlIdx = this.nextTemp();
     const limitIdx = this.nextTemp();
     const stepIdx = this.nextTemp();
 
     this.compileExpression(stmt.start);
-    this.emit("SET_LOCAL", varIdx, 0);
+    this.emit("SET_LOCAL", controlIdx, 0);
     this.compileExpression(stmt.end);
     this.emit("SET_LOCAL", limitIdx, 0);
     if (stmt.step) {
@@ -672,18 +887,20 @@ class VmCompiler {
     this.emitJump("JMP_IF_FALSE", branchLabel);
     this.emit("POP", 0, 0);
     const condOkLabel = this.makeLabel("for_cond_ok");
-    this.emitJumpB("JMP_IF_LOCAL_LE", this.packRegisterPair(varIdx, limitIdx), condOkLabel);
+    this.emitJumpB("JMP_IF_LOCAL_LE", this.packRegisterPair(controlIdx, limitIdx), condOkLabel);
     this.emitJump("JMP", endLabel);
     this.label(branchLabel);
     this.emit("POP", 0, 0);
-    this.emitJumpB("JMP_IF_LOCAL_GE", this.packRegisterPair(varIdx, limitIdx), condOkLabel);
+    this.emitJumpB("JMP_IF_LOCAL_GE", this.packRegisterPair(controlIdx, limitIdx), condOkLabel);
     this.emitJump("JMP", endLabel);
     this.label(condOkLabel);
 
+    this.emit("PUSH_LOCAL", controlIdx, 0);
+    this.emit("DECLARE_LOCAL", varIdx, 0);
     this.compileStatements(this.getBlockStatements(stmt.body));
 
     this.label(continueLabel);
-    this.emit("ADD_REG_LOCAL", varIdx, stepIdx);
+    this.emit("ADD_REG_LOCAL", controlIdx, stepIdx);
     this.emitJump("JMP", startLabel);
     this.label(endLabel);
 
@@ -737,11 +954,12 @@ class VmCompiler {
       this.emit("SET_LOCAL", slots[slotIndex], 0);
       slotIndex += 1;
     }
+    this.emit("PREP_ITER", this.packRegisterPair(fnIdx, stateIdx), ctrlIdx);
 
     const variables = stmt.variables || [];
     const varLocals = variables.map((variable) => {
       if (variable && variable.type === "Identifier") {
-        return this.defineLocal(variable.name);
+        return this.defineLocal(variable.name, { loopVariable: true });
       }
       return this.nextTemp();
     });
@@ -755,7 +973,7 @@ class VmCompiler {
     const retCount = Math.max(1, varLocals.length);
     this.emit("CALL", 2, retCount);
     for (let i = varLocals.length - 1; i >= 0; i -= 1) {
-      this.emit("SET_LOCAL", varLocals[i], 0);
+      this.emit("DECLARE_LOCAL", varLocals[i], 0);
     }
 
     if (varLocals.length > 0) {
@@ -803,6 +1021,98 @@ class VmCompiler {
   compileGotoStatement(stmt) {
     const label = stmt && (stmt.label || stmt.name) ? (stmt.label || stmt.name) : null;
     this.emitJump("JMP", this.getUserLabelName(label));
+  }
+
+  getFunctionDeclarationTarget(stmt) {
+    if (!stmt || !stmt.name || stmt.name.type !== "FunctionName") {
+      return null;
+    }
+    const base = stmt.name.base;
+    if (!base || !base.name) {
+      return null;
+    }
+    let target = { type: "Identifier", name: base.name };
+    const members = stmt.name.members || [];
+    for (const member of members) {
+      target = {
+        type: "MemberExpression",
+        base: target,
+        indexer: ".",
+        identifier: member,
+      };
+    }
+    if (stmt.name.method) {
+      target = {
+        type: "MemberExpression",
+        base: target,
+        indexer: ".",
+        identifier: stmt.name.method,
+      };
+    }
+    return target;
+  }
+
+  compileFunctionDeclaration(stmt) {
+    if (!stmt || stmt.type !== "FunctionDeclaration") {
+      return;
+    }
+    if (stmt.isLocal) {
+      const name = stmt.name && stmt.name.base && stmt.name.base.name;
+      if (!name || (stmt.name.members && stmt.name.members.length) || stmt.name.method) {
+        raise("Unsupported local function declaration target", stmt);
+      }
+      let localIdx = this.resolveLocal(name);
+      if (!localIdx) {
+        this.emit("PUSH_CONST", this.addConst(null), 0);
+        localIdx = this.defineLocal(name);
+        this.emit("DECLARE_LOCAL", localIdx, 0);
+      }
+      this.compileFunctionClosure(stmt);
+      this.emit("SET_LOCAL", localIdx, 0);
+      return;
+    }
+
+    const target = this.getFunctionDeclarationTarget(stmt);
+    if (!target) {
+      raise("Unsupported function declaration target", stmt);
+    }
+    this.compileFunctionClosure(stmt);
+    this.compileAssignTarget(target);
+  }
+
+  collectClosureCaptures(fnNode) {
+    const declared = collectDeclaredNamesInFunction(fnNode);
+    const captures = [];
+    const seen = new Set();
+    collectFreeIdentifierOrderInFunction(fnNode).forEach((name) => {
+      if (seen.has(name)) {
+        return;
+      }
+      const binding = this.resolveBinding(name);
+      if (!binding || !binding.index) {
+        return;
+      }
+      seen.add(name);
+      captures.push({ name, index: binding.index });
+    });
+    return captures;
+  }
+
+  compileFunctionClosure(fnNode) {
+    const captures = this.collectClosureCaptures(fnNode);
+    const child = new VmCompiler({ style: this.style, options: this.options });
+    const prebound = captures.map((capture, index) => ({
+      name: capture.name,
+      init: { cell: `__vm_captures[${index + 1}]` },
+      set: null,
+    }));
+    const program = child.compileFunction(fnNode, prebound);
+    const closureIndex = this.closures.length + 1;
+    this.closures.push({
+      program,
+      captures,
+    });
+    this.emit("PUSH_CLOSURE", closureIndex, 0);
   }
 
   compileAssignTarget(target) {
@@ -1051,7 +1361,8 @@ class VmCompiler {
         return;
       }
       case "VarargLiteral":
-        raise("vararg unsupported", expr);
+        this.compileVarargValue(expr, 1);
+        return;
       case "UnaryExpression": {
         const op = UNARY_OP_MAP.get(expr.operator);
         if (!op) {
@@ -1109,6 +1420,9 @@ class VmCompiler {
       case "IfExpression":
         this.compileIfExpression(expr);
         return;
+      case "FunctionExpression":
+        this.compileFunctionClosure(expr);
+        return;
       case "TypeAssertion":
         this.compileExpression(expr.expression);
         return;
@@ -1121,6 +1435,10 @@ class VmCompiler {
   }
 
   compileValueExpression(expr, retCount = 1) {
+    if (expr && expr.type === "VarargLiteral") {
+      this.compileVarargValue(expr, retCount);
+      return;
+    }
     if (!isCallLikeExpression(expr)) {
       this.compileExpression(expr);
       return;
@@ -1151,7 +1469,26 @@ class VmCompiler {
       return false;
     }
     const args = expr.arguments || [];
-    return args.length > 0 && isCallLikeExpression(args[args.length - 1]);
+    return args.length > 0 && isMultiReturnExpression(args[args.length - 1]);
+  }
+
+  assertVarargAvailable(expr) {
+    if (!this.functionHasVararg) {
+      raise("vararg outside vararg function", expr);
+    }
+  }
+
+  compileVarargValue(expr, retCount = 1) {
+    this.assertVarargAvailable(expr);
+    const count = Math.max(1, retCount || 1);
+    for (let i = 1; i <= count; i += 1) {
+      this.emit("PUSH_VARARG", i, 0);
+    }
+  }
+
+  compileVarargPack(expr) {
+    this.assertVarargAvailable(expr);
+    this.emit("PUSH_VARARGS", 0, 0);
   }
 
   emitTableValue(tableIdx, itemIndex, expr, retCount = 1) {
@@ -1176,6 +1513,16 @@ class VmCompiler {
     this.emit("PUSH_LOCAL", temp, 0);
     this.compileAppendCallLike(expr, 1);
     return temp;
+  }
+
+  compilePackMultiResults(expr) {
+    if (expr && expr.type === "VarargLiteral") {
+      const temp = this.nextTemp();
+      this.compileVarargPack(expr);
+      this.emit("SET_LOCAL", temp, 0);
+      return temp;
+    }
+    return this.compilePackCallResults(expr);
   }
 
   compileExpandedCallExpressionPreparation(expr) {
@@ -1203,7 +1550,7 @@ class VmCompiler {
         this.emitTableValue(prefixIdx, i + 2, args[i], 1);
       }
       this.emitPackedTableCount(prefixIdx, args.length);
-      const tailIdx = this.compilePackCallResults(tailExpr);
+      const tailIdx = this.compilePackMultiResults(tailExpr);
       return { fnIdx, prefixIdx, tailIdx };
     }
 
@@ -1215,7 +1562,7 @@ class VmCompiler {
       this.emitTableValue(prefixIdx, i + 1, args[i], 1);
     }
     this.emitPackedTableCount(prefixIdx, args.length - 1);
-    const tailIdx = this.compilePackCallResults(tailExpr);
+    const tailIdx = this.compilePackMultiResults(tailExpr);
     return { fnIdx, prefixIdx, tailIdx };
   }
 
@@ -1243,7 +1590,7 @@ class VmCompiler {
       this.emitTableValue(prefixIdx, i + 2, args[i], 1);
     }
     this.emitPackedTableCount(prefixIdx, args.length);
-    const tailIdx = this.compilePackCallResults(tailExpr);
+    const tailIdx = this.compilePackMultiResults(tailExpr);
     return { fnIdx, prefixIdx, tailIdx };
   }
 
@@ -1274,6 +1621,11 @@ class VmCompiler {
   }
 
   compileAppendCallLike(expr, startIndex) {
+    if (expr && expr.type === "VarargLiteral") {
+      this.compileVarargPack(expr);
+      this.emit("APPEND_VARARGS", startIndex, 0);
+      return;
+    }
     if (this.callHasExpandedTail(expr)) {
       const { fnIdx, prefixIdx, tailIdx } = this.compileExpandedCallPreparation(expr);
       this.emit("PUSH_LOCAL", fnIdx, 0);
@@ -1433,7 +1785,7 @@ class VmCompiler {
         this.emit("SET_TABLE", 0, 0);
       } else if (field.type === "TableValue") {
         this.emit("DUP", 0, 0);
-        if (isLastField && isCallLikeExpression(field.value)) {
+        if (isLastField && isMultiReturnExpression(field.value)) {
           this.compileAppendCallLike(field.value, listIndex);
           this.emit("POP", 0, 0);
         } else {
@@ -1454,7 +1806,7 @@ class VmCompiler {
         this.emit("SET_TABLE", 0, 0);
       } else if (field.kind === "list") {
         this.emit("DUP", 0, 0);
-        if (isLastField && isCallLikeExpression(field.value)) {
+        if (isLastField && isMultiReturnExpression(field.value)) {
           this.compileAppendCallLike(field.value, listIndex);
           this.emit("POP", 0, 0);
         } else {

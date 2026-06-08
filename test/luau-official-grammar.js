@@ -63,11 +63,20 @@ assert.strictEqual(
 const accepted = [
   "type Result<T, E> = T | E",
   "declare function id<T>(x: T): T",
+  "declare function pack<T...>(...: T...): T...",
+  "declare class Foo\n  prop: number\n  function method(self, foo: number): string\n  [string]: number\nend",
+  "declare extern type Bar extends Foo with\n  prop2: string\nend",
+  "declare extern type Empty",
+  "const answer = 42",
+  "const a, b, c = 42, f()",
+  "const a, b, c = 42, ...",
+  "const function getAnswer() return 42 end",
   "local x = if ok then 1 else 2",
   "continue",
   "x += 1",
   "@native function f() end",
   "local s = `hello {name}`",
+  "local s = `outer {`inner {name}`}`",
 ];
 
 for (const source of accepted) {
@@ -81,6 +90,27 @@ for (const source of accepted) {
 }
 
 {
+  const ast = custom.parseLuau("const answer = 42");
+  assert.strictEqual(ast.body[0].type, "LocalStatement");
+  assert.strictEqual(ast.body[0].isConst, true);
+  assert.strictEqual(ast.body[0].variables[0].name, "answer");
+}
+
+{
+  const ast = custom.parseLuau("const function getAnswer() return 42 end");
+  assert.strictEqual(ast.body[0].type, "StatLocalFunction");
+  assert.strictEqual(ast.body[0].isConst, true);
+  assert.strictEqual(ast.body[0].name.base.name, "getAnswer");
+}
+
+{
+  const ast = custom.parseLuau("declare class Foo\n  prop: number\n  function method(self, foo: number): string\nend");
+  assert.strictEqual(ast.body[0].type, "StatDeclareExternType");
+  assert.strictEqual(ast.body[0].declarationKind, "class");
+  assert.strictEqual(ast.body[0].props.length, 2);
+}
+
+{
   const ast = custom.parseLuau("x += 1");
   assert.strictEqual(ast.body[0].type, "CompoundAssignmentStatement");
   assert.strictEqual(ast.body[0].operator, "+=");
@@ -90,4 +120,10 @@ for (const source of accepted) {
   const ast = custom.parseLuau("local s = `hello {name}`");
   assert.strictEqual(ast.body[0].init[0].type, "ExprInterpString");
   assert.strictEqual(ast.body[0].init[0].parts[0].raw, "hello ");
+}
+
+{
+  const ast = custom.parseLuau("local s = `outer {`inner {name}`}`");
+  assert.strictEqual(ast.body[0].init[0].type, "ExprInterpString");
+  assert.strictEqual(ast.body[0].init[0].parts[1].type, "ExprInterpString");
 }

@@ -719,7 +719,7 @@
         <section class="panel">
       <h2>Options</h2>
       <p class="panel-subtitle">Start with a preset, then open the language-specific sections only if you want finer control.</p>
-      <div class="row two">
+      <div class="row three">
         <div>
           <label for="preset">Preset</label>
           <select id="preset">
@@ -727,6 +727,14 @@
             <option value="balanced">Balanced</option>
             <option value="low">Low</option>
             <option value="custom">Custom</option>
+          </select>
+        </div>
+        <div>
+          <label for="scheme">JS Scheme</label>
+          <select id="scheme">
+            <option value="classic">Classic</option>
+            <option value="stealth">Stealth</option>
+            <option value="runtime">Runtime</option>
           </select>
         </div>
         <div>
@@ -804,6 +812,7 @@
             <label for="optCffMode">CFF mode</label>
             <select id="optCffMode">
               <option value="classic">classic</option>
+              <option value="woven">woven</option>
               <option value="vm">vm</option>
             </select>
             <label class="checkbox"><input id="optCffOpaque" type="checkbox" checked /> Opaque predicates</label>
@@ -970,6 +979,7 @@
     const inputNameEl = document.getElementById("inputName");
     const outputNameEl = document.getElementById("outputName");
     const presetEl = document.getElementById("preset");
+    const schemeEl = document.getElementById("scheme");
     const langEl = document.getElementById("lang");
     const devPanel = document.getElementById("devPanel");
     const backendModeEl = document.getElementById("backendMode");
@@ -1459,6 +1469,7 @@
       }
 
       const isLuau = langEl.value === "luau";
+      schemeEl.disabled = isLuau;
       if (groupJsOptions && groupLuauOptions) {
         groupJsOptions.open = !isLuau;
         groupLuauOptions.open = isLuau;
@@ -1595,6 +1606,7 @@
 
       const options = {
         preset: presetEl.value === "custom" ? undefined : presetEl.value,
+        scheme: schemeEl.value,
         lang: langEl.value,
         rename: optRename.checked,
         strings: optStrings.checked,

@@ -4,6 +4,9 @@ function buildCliArgs(options = {}) {
   if (options.preset) {
     args.push("--preset", String(options.preset));
   }
+  if (options.scheme || options.jsScheme) {
+    args.push("--scheme", String(options.scheme || options.jsScheme));
+  }
   if (options.lang) {
     args.push("--lang", String(options.lang));
   }
@@ -157,6 +160,9 @@ function buildCliArgs(options = {}) {
     args.push("--cff-opaque");
   } else if (cffOptions.opaque === false) {
     args.push("--no-cff-opaque");
+  }
+  if (cffOptions.hideTopReturnExpr === true) {
+    args.push("--cff-hide-top-return-expr");
   }
   if (options.dead === false) {
     args.push("--no-dead");

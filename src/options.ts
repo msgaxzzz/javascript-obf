@@ -10,6 +10,7 @@ export interface NormalizedVmOptions {
 
 export interface NormalizedOptions {
   preset: string;
+  scheme: string;
   lang: string;
   luauParser: string;
   filename: string;

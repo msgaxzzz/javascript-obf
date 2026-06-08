@@ -7,6 +7,7 @@ const { parseLuau: parseFromAst } = require("../src/luau/ast");
 const { parseLuau: parseCanonical } = require("../src/luau/custom");
 const { parse: parseCustom } = require("../src/luau/custom/parser");
 const { walk } = require("../src/luau/ast");
+const { decodeRawString } = require("../src/luau/strings");
 const { RNG } = require("../src/utils/rng");
 
 assert.ok(rename, "rename transform should still load");
@@ -32,13 +33,9 @@ function hasEnvIndex(ast, name) {
     if (!index || index.type !== "StringLiteral") {
       return;
     }
-    let value = typeof index.value === "string" ? index.value : null;
-    if (value === null && typeof index.raw === "string" && index.raw.length >= 2) {
-      const quote = index.raw[0];
-      if (quote === "\"" || quote === "'") {
-        value = index.raw.slice(1, -1);
-      }
-    }
+    const value = typeof index.value === "string"
+      ? index.value
+      : (typeof index.raw === "string" ? decodeRawString(index.raw) : null);
     if (value === name) {
       found = true;
     }
@@ -57,6 +54,24 @@ function hasCallBase(ast, name) {
     }
   });
   return found;
+}
+
+function getLeadingLocalNames(ast, count) {
+  const names = [];
+  for (const stmt of ast.body || []) {
+    if (!stmt || stmt.type !== "LocalStatement") {
+      break;
+    }
+    for (const variable of stmt.variables || []) {
+      if (variable && variable.type === "Identifier") {
+        names.push(variable.name);
+      }
+    }
+    if (names.length >= count) {
+      break;
+    }
+  }
+  return names.slice(0, count);
 }
 
 function runAstCompatContract() {
@@ -153,12 +168,39 @@ async function runRepeatUntilScopeRegression() {
   assert.ok(!hasEnvIndex(ast, "x"), "repeat-until locals should remain visible in the condition");
 }
 
+async function runShortAliasAndGlobalAssignmentRegression() {
+  const globalWriteSource = [
+    "x = 1",
+    "print(x)",
+  ].join("\n");
+
+  const { code } = await obfuscateLuau(globalWriteSource, {
+    lang: "luau",
+    luauParser: "custom",
+    rename: false,
+    strings: false,
+    cff: false,
+    dead: false,
+    vm: false,
+    renameOptions: { maskGlobals: true },
+    seed: "mask-globals-short-global-write",
+  });
+
+  const ast = parseCustom(code);
+  const aliases = getLeadingLocalNames(ast, 2);
+  assert.deepStrictEqual(aliases, ["a", "b"], "maskGlobals should use shortest env/getfenv aliases first");
+  assert.ok(hasEnvIndex(ast, "x"), "global assignment/read should be masked through env alias");
+  assert.ok(hasEnvIndex(ast, "print"), "global print call should be masked through env alias");
+  assert.ok(!/[^A-Za-z0-9_]x\s*=/.test(code), "global assignment should not remain a bare identifier target");
+}
+
 (async () => {
   runAstCompatContract();
   runAstCompatOptions();
   runCanonicalMaskGlobalsContract();
   await run();
   await runRepeatUntilScopeRegression();
+  await runShortAliasAndGlobalAssignmentRegression();
   console.log("luau-mask-globals: ok");
 })().catch((err) => {
   console.error(err);

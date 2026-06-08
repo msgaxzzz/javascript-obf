@@ -101,10 +101,11 @@ class VmCompiler {
   }
 
   createTempName() {
-    let name = `_vm$tmp${this.tempIndex++}`;
+    let name = this.ctx.nameGen.next();
     while (this.locals.has(name)) {
-      name = `_vm$tmp${this.tempIndex++}`;
+      name = this.ctx.nameGen.next();
     }
+    this.tempIndex += 1;
     this.locals.add(name);
     return name;
   }

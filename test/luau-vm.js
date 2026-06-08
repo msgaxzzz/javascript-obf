@@ -450,6 +450,84 @@ async function runExpandArgsOptimization() {
   assert.ok(hasTableMoveExpandArgs(code), "expandArgs should use table.move when available");
 }
 
+async function runVarargVmRegression() {
+  const varargSource = [
+    "local function f(...)",
+    "  return select('#', ...), ...",
+    "end",
+    "local function test(...)",
+    "  local n = select('#', ...)",
+    "  local a, b = ...",
+    "  local packed = {0, ...}",
+    "  local x, y, z = f(7, ...)",
+    "  return n, a, b, #packed, packed[1], packed[2], packed[3], x, y, z",
+    "end",
+    "local n, a, b, len, p0, p1, p2, x, y, z = test(4, 5)",
+    "print(n, a, b, len, p0, p1, p2, x, y, z)",
+  ].join("\n");
+
+  const code = await obfuscateSemanticVm(varargSource, "test", "vm-vararg-regression");
+  assert.ok(hasVmLoop(code), "vararg functions should be virtualized instead of skipped");
+  assert.strictEqual(
+    runLuau(code),
+    "2\t4\t5\t3\t0\t4\t5\t3\t7\t4",
+    "VM should preserve vararg count, fixed reads, call-tail expansion, and table-tail expansion"
+  );
+}
+
+async function runGeneralizedIterationVmRegression() {
+  const iterSource = [
+    "local function test()",
+    "  local sum = 0",
+    "  for _, v in {1, 2, 3} do",
+    "    sum += v",
+    "  end",
+    "  return sum",
+    "end",
+    "print(test())",
+  ].join("\n");
+
+  const code = await obfuscateSemanticVm(iterSource, "test", "vm-generalized-iteration");
+  assert.strictEqual(
+    runLuau(code),
+    "6",
+    "VM generic-for should support Luau direct table iteration"
+  );
+}
+
+async function runBlockDispatchSemanticRegression() {
+  const blockSource = [
+    "local function test(a, b)",
+    "  local c = a + b",
+    "  return c * 2",
+    "end",
+    "print(test(2, 5))",
+  ].join("\n");
+
+  const { code } = await obfuscateLuau(blockSource, {
+    lang: "luau",
+    luauParser: "custom",
+    vm: {
+      ...createSemanticVmOptions("test"),
+      blockDispatch: true,
+    },
+    cff: false,
+    strings: false,
+    rename: false,
+    constArray: false,
+    numbers: false,
+    proxifyLocals: false,
+    padFooter: false,
+    seed: "vm-block-dispatch-semantic",
+  });
+
+  assert.strictEqual(
+    runLuau(code),
+    "14",
+    "block dispatch should execute ordinary stack opcodes instead of treating unknown direct-block opcodes as nops"
+  );
+}
+
 async function runAlternateOpcodeEncodingMode() {
   const { code } = await obfuscateLuau(source, {
     lang: "luau",
@@ -1988,6 +2066,9 @@ async function runFakeOpcodeRetryTableReturnRegression() {
   await runRepeatConditionScope();
   await runCallArgumentExpansion();
   await runExpandArgsOptimization();
+  await runVarargVmRegression();
+  await runGeneralizedIterationVmRegression();
+  await runBlockDispatchSemanticRegression();
   await runSingleAssignmentOrdering();
   await runCapturedLocalWriteback();
   await runCapturedAnonymousClosureRead();

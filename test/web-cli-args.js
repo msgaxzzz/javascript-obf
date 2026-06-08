@@ -7,7 +7,12 @@ function includesPair(args, flag, value) {
 }
 
 const args = buildCliArgs({
+  scheme: "stealth",
   lang: "luau",
+  cffOptions: {
+    mode: "woven",
+    hideTopReturnExpr: true,
+  },
   vm: {
     enabled: true,
     mode: "max",
@@ -26,6 +31,9 @@ const args = buildCliArgs({
   },
 });
 
+assert(includesPair(args, "--scheme", "stealth"), "expected --scheme stealth");
+assert(includesPair(args, "--cff-mode", "woven"), "expected --cff-mode woven");
+assert(args.includes("--cff-hide-top-return-expr"), "expected --cff-hide-top-return-expr");
 assert(args.includes("--vm"), "expected --vm");
 assert(includesPair(args, "--vm-mode", "max"), "expected --vm-mode max");
 assert(includesPair(args, "--vm-opcode-encoding", "pairs"), "expected --vm-opcode-encoding pairs");

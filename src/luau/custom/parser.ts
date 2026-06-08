@@ -159,6 +159,11 @@ class Parser {
       stmt = this.parseDeclareStatement();
     } else if (this.is("keyword", "local")) {
       stmt = this.parseLocalStatement();
+    } else if (
+      this.is("identifier", "const") &&
+      (this.peek().type === "identifier" || (this.peek().type === "keyword" && this.peek().value === "function"))
+    ) {
+      stmt = this.parseConstStatement();
     } else if (this.is("keyword", "function")) {
       stmt = this.parseFunctionDeclaration(false);
     } else if (this.is("keyword", "if")) {
@@ -207,8 +212,21 @@ class Parser {
       }
     }
 
+    if (attributes.length && !this.statementAllowsAttributes(stmt)) {
+      this.raise("Attributes can only be applied to function declarations", start);
+    }
     stmt = this.attachAttributes(stmt, attributes);
     return this.finishNode(stmt, start);
+  }
+
+  statementAllowsAttributes(stmt) {
+    return Boolean(
+      stmt &&
+        (stmt.type === "FunctionDeclaration" ||
+          stmt.type === "TypeFunctionStatement" ||
+          stmt.type === "ExportTypeFunctionStatement" ||
+          stmt.type === "DeclareFunctionStatement")
+    );
   }
 
   isContinueStatement() {
@@ -345,7 +363,7 @@ class Parser {
     this.expect("symbol", ")");
     let returnTypes = [];
     if (this.eat("symbol", ":")) {
-      returnTypes = this.parseTypeExpressionList();
+      returnTypes = this.parseTypeExpressionList(true);
     }
     const body = this.parseBlock(["end"]);
     this.expect("keyword", "end");
@@ -368,6 +386,14 @@ class Parser {
       const stmt = this.parseDeclareFunctionStatement();
       return this.finishNode(stmt, start);
     }
+    if (this.is("identifier", "class")) {
+      const stmt = this.parseDeclareExternTypeStatement("class");
+      return this.finishNode(stmt, start);
+    }
+    if (this.is("identifier", "extern")) {
+      const stmt = this.parseDeclareExternTypeStatement("extern");
+      return this.finishNode(stmt, start);
+    }
     const name = this.parseIdentifier();
     this.expect("symbol", ":");
     const annotation = this.parseTypeExpression();
@@ -382,9 +408,10 @@ class Parser {
     this.expect("symbol", "(");
     const { parameters, hasVararg, varargAnnotation } = this.parseFunctionParameters();
     this.expect("symbol", ")");
+    this.validateDeclarationParameters(parameters, hasVararg, varargAnnotation, "All declaration parameters must be annotated");
     let returnType = null;
     if (this.eat("symbol", ":")) {
-      returnType = this.parseTypeExpression();
+      returnType = this.parseTypeExpression(true);
     }
     return this.finishNode({
       type: "DeclareFunctionStatement",
@@ -395,6 +422,127 @@ class Parser {
       varargAnnotation,
       returnType,
     }, start);
+  }
+
+  parseDeclareExternTypeStatement(kind) {
+    const start = this.current;
+    if (kind === "class") {
+      this.expect("identifier", "class");
+    } else {
+      this.expect("identifier", "extern");
+      this.expect("keyword", "type");
+    }
+    const name = this.parseIdentifier();
+    let superName = null;
+    if (this.eat("identifier", "extends")) {
+      superName = this.parseIdentifier();
+    }
+    const props = [];
+    let indexer = null;
+    let hasBody = kind === "class";
+    if (kind === "extern" && this.eat("identifier", "with")) {
+      hasBody = true;
+    }
+    if (hasBody) {
+      while (!this.is("eof") && !this.is("keyword", "end")) {
+        if (this.eat("symbol", ";")) {
+          continue;
+        }
+        const member = this.parseDeclareExternTypeMember();
+        if (member.kind === "indexer") {
+          if (indexer) {
+            this.raise("Cannot have more than one indexer on an extern type", member);
+          }
+          indexer = member;
+        } else {
+          props.push(member);
+        }
+        this.eat("symbol", ",");
+        this.eat("symbol", ";");
+      }
+      this.expect("keyword", "end");
+    }
+    return this.finishNode({
+      type: "DeclareExternTypeStatement",
+      declarationKind: kind,
+      name,
+      superName,
+      props,
+      indexer,
+      hasBody,
+    }, start);
+  }
+
+  parseDeclareExternTypeMember() {
+    const access = this.parseTableAccess();
+    if (this.is("keyword", "function")) {
+      if (access) {
+        this.raise("Extern type method cannot have a table access modifier");
+      }
+      return this.parseDeclareExternTypeMethod();
+    }
+    if (this.eat("symbol", "[")) {
+      const start = this.last;
+      let indexAccess = access;
+      if (!indexAccess && (this.is("identifier", "read") || this.is("identifier", "write"))) {
+        indexAccess = this.current.value;
+        this.advance();
+      }
+      const key = this.parseTypeExpression();
+      this.expect("symbol", "]");
+      this.expect("symbol", ":");
+      const value = this.parseTypeExpression();
+      return this.finishNode({ type: "DeclareExternTypeIndexer", kind: "indexer", key, value, access: indexAccess }, start);
+    }
+    const start = this.current;
+    const name = this.parseIdentifier();
+    this.expect("symbol", ":");
+    const value = this.parseTypeExpression();
+    return this.finishNode({ type: "DeclareExternTypeProperty", kind: "property", name, value, access }, start);
+  }
+
+  parseDeclareExternTypeMethod() {
+    const start = this.current;
+    this.expect("keyword", "function");
+    const name = this.parseIdentifier();
+    const typeParameters = this.parseTypeParameterList(false);
+    this.expect("symbol", "(");
+    const { parameters, hasVararg, varargAnnotation } = this.parseFunctionParameters();
+    this.expect("symbol", ")");
+    if (!parameters[0] || parameters[0].name !== "self" || parameters[0].annotation) {
+      this.raise("'self' must be present as the unannotated first parameter", start);
+    }
+    this.validateDeclarationParameters(
+      parameters.slice(1),
+      hasVararg,
+      varargAnnotation,
+      "All declaration parameters aside from 'self' must be annotated",
+    );
+    let returnType = null;
+    if (this.eat("symbol", ":")) {
+      returnType = this.parseTypeExpression(true);
+    }
+    return this.finishNode({
+      type: "DeclareExternTypeProperty",
+      kind: "method",
+      name,
+      parameters,
+      hasVararg,
+      varargAnnotation,
+      returnType,
+      typeParameters,
+    }, start);
+  }
+
+  validateDeclarationParameters(parameters, hasVararg, varargAnnotation, message) {
+    for (const param of parameters) {
+      if (!param || !param.annotation) {
+        this.raise(message, param || this.current);
+      }
+    }
+    if (hasVararg && !varargAnnotation) {
+      this.raise(message);
+    }
   }
 
   parseLocalStatement() {
@@ -417,6 +565,35 @@ class Parser {
       init = this.parseExpressionList();
     }
     return this.finishNode({ type: "LocalStatement", variables, init }, start);
+  }
+
+  parseConstStatement() {
+    const start = this.current;
+    this.expect("identifier", "const");
+    if (this.is("keyword", "function")) {
+      const stmt = this.parseFunctionDeclaration(true);
+      stmt.isConst = true;
+      return this.finishNode(stmt, start);
+    }
+    const variables = [this.parseTypedIdentifier()];
+    while (this.eat("symbol", ",")) {
+      variables.push(this.parseTypedIdentifier());
+    }
+    this.expect("symbol", "=");
+    const init = this.parseExpressionList();
+    this.validateConstInitializerCount(variables, init);
+    return this.finishNode({ type: "LocalStatement", variables, init, isConst: true }, start);
+  }
+
+  validateConstInitializerCount(variables, init) {
+    if (init.length >= variables.length) {
+      return;
+    }
+    const last = init[init.length - 1];
+    if (last && (last.type === "CallExpression" || last.type === "MethodCallExpression" || last.type === "VarargLiteral")) {
+      return;
+    }
+    this.raise("Missing initializer in const declaration", last || this.current);
   }
 
   parseFunctionName(isLocal) {
@@ -445,7 +622,7 @@ class Parser {
         hasVararg = true;
         this.eat("symbol", "...");
         if (this.eat("symbol", ":")) {
-          varargAnnotation = this.parseTypeExpression();
+          varargAnnotation = this.parseTypeExpression(true);
         }
       } else {
         parameters.push(this.parseTypedIdentifier());
@@ -454,7 +631,7 @@ class Parser {
             hasVararg = true;
             this.eat("symbol", "...");
             if (this.eat("symbol", ":")) {
-              varargAnnotation = this.parseTypeExpression();
+              varargAnnotation = this.parseTypeExpression(true);
             }
             break;
           }
@@ -475,7 +652,7 @@ class Parser {
     this.expect("symbol", ")");
     let returnType = null;
     if (this.eat("symbol", ":")) {
-      returnType = this.parseTypeExpression();
+      returnType = this.parseTypeExpression(true);
     }
     const body = this.parseBlock(["end"]);
     this.expect("keyword", "end");
@@ -501,7 +678,7 @@ class Parser {
     this.expect("symbol", ")");
     let returnType = null;
     if (this.eat("symbol", ":")) {
-      returnType = this.parseTypeExpression();
+      returnType = this.parseTypeExpression(true);
     }
     const body = this.parseBlock(["end"]);
     this.expect("keyword", "end");
@@ -880,6 +1057,8 @@ class Parser {
     }
     this.expect("symbol", "<");
     const params = [];
+    let seenPack = false;
+    let seenDefault = false;
     do {
       let isPack = false;
       let packStyle = null;
@@ -895,7 +1074,11 @@ class Parser {
         isPack = true;
         packStyle = "postfix";
       }
+      if (!isPack && seenPack) {
+        this.raise("Generic types come before generic type packs", param);
+      }
       if (isPack) {
+        seenPack = true;
         param.isPack = true;
         param.packStyle = packStyle;
       }
@@ -903,7 +1086,13 @@ class Parser {
         if (!allowDefault) {
           this.raise("Generic function type parameters cannot have defaults");
         }
-        param.default = this.parseTypeExpression();
+        seenDefault = true;
+        param.default = this.parseTypeExpression(isPack);
+        if (isPack && !isTypePackDefault(param.default)) {
+          this.raise("Expected type pack after '=', got type", param.default);
+        }
+      } else if (seenDefault) {
+        this.raise(isPack ? "Expected default type pack after type pack name" : "Expected default type after type name", param);
       }
       params.push(param);
     } while (this.eat("symbol", ","));
@@ -911,23 +1100,23 @@ class Parser {
     return params;
   }
 
-  parseTypeExpression() {
-    return this.parseTypeUnion();
+  parseTypeExpression(allowTypePack = false) {
+    return this.parseTypeUnion(allowTypePack);
   }
 
-  parseTypeExpressionList() {
-    const types = [this.parseTypeExpression()];
+  parseTypeExpressionList(allowTypePack = false) {
+    const types = [this.parseTypeExpression(allowTypePack)];
     while (this.eat("symbol", ",")) {
-      types.push(this.parseTypeExpression());
+      types.push(this.parseTypeExpression(allowTypePack));
     }
     return types;
   }
 
-  parseTypeUnion() {
-    let type = this.parseTypeIntersection();
+  parseTypeUnion(allowTypePack = false) {
+    let type = this.parseTypeIntersection(allowTypePack);
     const types = [type];
     while (this.eat("symbol", "|")) {
-      types.push(this.parseTypeIntersection());
+      types.push(this.parseTypeIntersection(allowTypePack));
     }
     if (types.length > 1) {
       const start = this.nodeStart(types[0]) || this.current;
@@ -936,11 +1125,11 @@ class Parser {
     return type;
   }
 
-  parseTypeIntersection() {
-    let type = this.parseTypePostfix();
+  parseTypeIntersection(allowTypePack = false) {
+    let type = this.parseTypePostfix(allowTypePack);
     const types = [type];
     while (this.eat("symbol", "&")) {
-      types.push(this.parseTypePostfix());
+      types.push(this.parseTypePostfix(allowTypePack));
     }
     if (types.length > 1) {
       const start = this.nodeStart(types[0]) || this.current;
@@ -949,8 +1138,8 @@ class Parser {
     return type;
   }
 
-  parseTypePostfix() {
-    let type = this.parseTypePrimary();
+  parseTypePostfix(allowTypePack = false) {
+    let type = this.parseTypePrimary(allowTypePack);
     while (true) {
       if (this.is("symbol", "<") && type.type === "TypeReference") {
         const argsInfo = this.parseTypeArgumentList();
@@ -966,6 +1155,9 @@ class Parser {
         continue;
       }
       if (this.eat("symbol", "...")) {
+        if (!allowTypePack) {
+          this.raise("Unexpected '...' after type name; type pack is not allowed in this context", this.last);
+        }
         const start = this.nodeStart(type) || this.last;
         type = this.finishNode({ type: "TypePack", value: type, postfix: true }, start);
         continue;
@@ -980,19 +1172,22 @@ class Parser {
     if (this.eat("symbol", ">")) {
       return { args: [], explicit: true };
     }
-    const args = [this.parseTypeExpression()];
+    const args = [this.parseTypeExpression(true)];
     while (this.eat("symbol", ",")) {
-      args.push(this.parseTypeExpression());
+      args.push(this.parseTypeExpression(true));
     }
     this.expect("symbol", ">" );
     return { args, explicit: true };
   }
 
-  parseTypePrimary() {
+  parseTypePrimary(allowTypePack = false) {
     if (this.is("symbol", "...")) {
+      if (!allowTypePack) {
+        this.raise("Unexpected '...' in type annotation", this.current);
+      }
       const start = this.current;
       this.eat("symbol", "...");
-      const type = this.parseTypePrimary();
+      const type = this.parseTypePrimary(false);
       return this.finishNode({ type: "VariadicType", value: type }, start);
     }
     if (this.is("symbol", "<")) {
@@ -1000,13 +1195,13 @@ class Parser {
       if (!this.is("symbol", "(")) {
         this.raise("Generic function types must be followed by parameter list");
       }
-      return this.parseFunctionOrTupleType(typeParameters);
+      return this.parseFunctionOrTupleType(typeParameters, true);
     }
     if (this.is("symbol", "{")) {
       return this.parseTableType();
     }
     if (this.is("symbol", "(")) {
-      return this.parseFunctionOrTupleType(null);
+      return this.parseFunctionOrTupleType(null, allowTypePack);
     }
     if (this.is("keyword", "typeof")) {
       const start = this.current;
@@ -1100,7 +1295,7 @@ class Parser {
     return null;
   }
 
-  parseFunctionOrTupleType(typeParameters) {
+  parseFunctionOrTupleType(typeParameters, allowTuplePack = false) {
     const start = this.current;
     this.expect("symbol", "(");
     const params = [];
@@ -1111,8 +1306,11 @@ class Parser {
         const value = this.parseTypeExpression();
         params.push(this.finishNode({ type: "TypePack", value }, packStart));
       } else {
-        params.push(this.parseTypeParameter());
+        params.push(this.parseTypeParameter(true));
         while (this.eat("symbol", ",")) {
+          if (isTypePackNode(params[params.length - 1])) {
+            this.raise("Variadic type pack must be last in a type list", this.last);
+          }
           if (this.is("symbol", "...")) {
             const packStart = this.current;
             this.eat("symbol", "...");
@@ -1120,17 +1318,20 @@ class Parser {
             params.push(this.finishNode({ type: "TypePack", value }, packStart));
             break;
           }
-          params.push(this.parseTypeParameter());
+          params.push(this.parseTypeParameter(true));
         }
       }
     }
     this.expect("symbol", ")");
     if (this.eat("symbol", "->")) {
-      const returnTypes = this.parseTypeExpressionList();
+      const returnTypes = this.parseTypeExpressionList(true);
       return this.finishNode({ type: "FunctionType", parameters: params, returnTypes, typeParameters }, start);
     }
     if (typeParameters !== null && typeParameters !== undefined) {
       this.raise("Generic function types must specify return types");
+    }
+    if (!allowTuplePack && params.some(isTypePackNode)) {
+      this.raise("Unexpected '...' after type annotation", start);
     }
     if (params.length === 1 && params[0].type === "TypeParameter") {
       return this.finishNode({ type: "ParenthesizedType", value: params[0].value }, start);
@@ -1139,16 +1340,16 @@ class Parser {
     return this.finishNode({ type: "TupleType", items }, start);
   }
 
-  parseTypeParameter() {
+  parseTypeParameter(allowTypePack = false) {
     if (this.is("identifier") && this.peek().type === "symbol" && this.peek().value === ":") {
       const start = this.current;
       const name = this.parseIdentifier();
       this.expect("symbol", ":");
-      const value = this.parseTypeExpression();
+      const value = this.parseTypeExpression(allowTypePack);
       return this.finishNode({ type: "TypeParameter", name, value }, start);
     }
     const start = this.current;
-    return this.finishNode({ type: "TypeParameter", name: null, value: this.parseTypeExpression() }, start);
+    return this.finishNode({ type: "TypeParameter", name: null, value: this.parseTypeExpression(allowTypePack) }, start);
   }
 
   parseIdentifier() {
@@ -1173,7 +1374,7 @@ class Parser {
     const tok = this.expect("interpString");
     const raw = tok.value;
     if (!raw || raw.length < 2 || raw[0] !== "`" || raw[raw.length - 1] !== "`") {
-      return this.finishNode({ type: "InterpolatedString", raw }, tok, tok);
+      this.raise("Incomplete interpolated string", tok);
     }
     const content = raw.slice(1, -1);
     const parts = [];
@@ -1195,12 +1396,14 @@ class Parser {
       }
       const end = findInterpolationEnd(content, next + 1);
       if (end === -1) {
-        return this.finishNode({ type: "InterpolatedString", raw }, tok, tok);
+        const errorToken = makeOffsetToken(tok, next, 1);
+        throw makeDiagnosticError("Unterminated interpolation expression", errorToken);
       }
       const exprSource = content.slice(next + 1, end);
       const expr = parseInterpolationExpression(exprSource);
       if (!expr) {
-        return this.finishNode({ type: "InterpolatedString", raw }, tok, tok);
+        const errorToken = makeOffsetToken(tok, next + 1, Math.max(1, exprSource.length));
+        throw makeDiagnosticError("Expected expression in interpolated string", errorToken);
       }
       parts.push(expr);
       cursor = end + 1;
@@ -1284,6 +1487,28 @@ function isAttributeLiteral(node) {
     default:
       return false;
   }
+}
+
+function isTypePackNode(node) {
+  if (!node) {
+    return false;
+  }
+  if (node.type === "TypePack" || node.type === "VariadicType") {
+    return true;
+  }
+  return node.type === "TypeParameter" && isTypePackNode(node.value);
+}
+
+function isTypePackDefault(node) {
+  if (!node) {
+    return false;
+  }
+  return (
+    node.type === "TypePack" ||
+    node.type === "VariadicType" ||
+    node.type === "TupleType" ||
+    node.type === "ParenthesizedType"
+  );
 }
 
 function parseInterpolationExpression(source) {

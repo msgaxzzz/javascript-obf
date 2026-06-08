@@ -28,9 +28,10 @@ function buildRuntime({
   key,
   shift,
   rotKey,
+  valueName,
+  bytesName,
+  errMessage,
 }) {
-  const valueName = "__obf_val";
-  const bytesName = "__obf_bytes";
   const poolDecls = poolNames
     .map((name, idx) => {
       const meta = poolMeta[idx];
@@ -48,7 +49,7 @@ function buildRuntime({
   const poolSelectCases = poolNames
     .map((name, idx) => `    case ${idx}: return ${name};`)
     .join("\n");
-  const errExpr = buildCharCodeExpr("Decoder unavailable");
+  const errExpr = buildCharCodeExpr(errMessage || "decode unavailable");
   // ChaCha20 runtime implementation
   const code = `
 ${poolDecls}

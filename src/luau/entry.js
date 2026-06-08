@@ -1,5 +1,5 @@
 const { walk } = require("./ast");
-const { collectIdentifierNames, makeNameFactory } = require("./names");
+const { collectIdentifierNames, makeShortNameFactory } = require("./names");
 
 function stringLiteral(value, ctx) {
   const raw = JSON.stringify(value);
@@ -16,7 +16,7 @@ function isGlobalEnv(node) {
 function entryLuau(ast, ctx) {
   let replacement = null;
   const used = collectIdentifierNames(ast, ctx);
-  const nameGen = makeNameFactory(ctx.rng, used);
+  const nameGen = makeShortNameFactory(ctx.rng, used);
   walk(ast, (node, parent, key, index) => {
     if (!node || !parent || key === null || key === undefined) {
       return;

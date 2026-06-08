@@ -24,6 +24,15 @@ function loadPrebuiltModuleIfAvailable(tsPath, parentModule) {
   if (!builtPath || !fs.existsSync(builtPath)) {
     return null;
   }
+  try {
+    const sourceStat = fs.statSync(tsPath);
+    const builtStat = fs.statSync(builtPath);
+    if (sourceStat.mtimeMs > builtStat.mtimeMs) {
+      return null;
+    }
+  } catch (_err) {
+    return null;
+  }
 
   return require(builtPath);
 }

@@ -8,6 +8,14 @@ const {
 } = require("./pool");
 const { buildRuntime } = require("./runtime");
 
+const RUNTIME_ERROR_MESSAGES = [
+  "decode unavailable",
+  "codec unavailable",
+  "stream unavailable",
+  "buffer decode failed",
+  "text decode failed",
+];
+
 function stringEncode(ast, ctx) {
   const { segments, programPathRef } = encodeStrings(ast, ctx);
 
@@ -36,6 +44,8 @@ function stringEncode(ast, ctx) {
     const unshiftId = t.identifier(ctx.nameGen.next());
     const poolSelectId = t.identifier(ctx.nameGen.next());
     const getEncodedId = t.identifier(ctx.nameGen.next());
+    const valueName = ctx.nameGen.next();
+    const bytesName = ctx.nameGen.next();
     const rotKeyLength = rng.int(3, 8);
     const rotKey = Array.from(
       { length: rotKeyLength },
@@ -85,6 +95,9 @@ function stringEncode(ast, ctx) {
       key: segment.key,
       shift: segment.indexShift,
       rotKey,
+      valueName,
+      bytesName,
+      errMessage: rng.pick(RUNTIME_ERROR_MESSAGES),
     });
     runtimeNodes.push(...runtime);
   }

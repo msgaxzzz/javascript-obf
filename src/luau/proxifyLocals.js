@@ -1,5 +1,5 @@
 const { walk } = require("./ast");
-const { collectIdentifierNames, makeNameFactory } = require("./names");
+const { collectIdentifierNames, makeShortNameFactory } = require("./names");
 const { getCachedSSAUsedNamesFromRoot } = require("./ssa-utils");
 
 const RESERVED = new Set([
@@ -504,8 +504,8 @@ function proxifyLocals(ast, ctx) {
   if (ssaRoot) {
     getCachedSSAUsedNamesFromRoot(ssaRoot).forEach((name) => used.add(name));
   }
-  const nameGen = makeNameFactory(ctx.rng, used);
-  const slotKeyGen = makeNameFactory(ctx.rng, used);
+  const nameGen = makeShortNameFactory(ctx.rng, used);
+  const slotKeyGen = makeShortNameFactory(ctx.rng, used);
   const state = {
     ...ctx,
     nameGen,

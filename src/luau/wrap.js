@@ -1,4 +1,4 @@
-const { collectIdentifierNames, makeNameFactory } = require("./names");
+const { collectIdentifierNames, makeShortNameFactory } = require("./names");
 
 function identifier(name) {
   return { type: "Identifier", name };
@@ -73,7 +73,7 @@ function wrapInFunction(ast, ctx) {
     return;
   }
   const used = collectIdentifierNames(ast, ctx);
-  const nameGen = makeNameFactory(ctx.rng, used);
+  const nameGen = makeShortNameFactory(ctx.rng, used);
   const isCustom = !ctx.options || ctx.options.luauParser !== "luaparse";
   for (let i = 0; i < iterations; i += 1) {
     wrapOnce(ast, nameGen, isCustom);

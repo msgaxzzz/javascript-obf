@@ -1,5 +1,5 @@
 const { walk } = require("./ast");
-const { collectIdentifierNames, makeNameFactory } = require("./names");
+const { collectIdentifierNames, makeShortNameFactory } = require("./names");
 
 const SUPPORTED_STATEMENTS = new Set([
   "LocalStatement",
@@ -7,6 +7,22 @@ const SUPPORTED_STATEMENTS = new Set([
   "CompoundAssignmentStatement",
   "CallStatement",
   "ReturnStatement",
+]);
+
+const WOVEN_STATIC_STATEMENTS = new Set([
+  "TypeAliasStatement",
+  "ExportTypeStatement",
+  "TypeFunctionStatement",
+  "ExportTypeFunctionStatement",
+  "DeclareFunctionStatement",
+  "DeclareVariableStatement",
+]);
+
+const WOVEN_UNSAFE_TOP_LEVEL = new Set([
+  "BreakStatement",
+  "ContinueStatement",
+  "GotoStatement",
+  "LabelStatement",
 ]);
 
 function buildStateValues(count, rng) {
@@ -45,6 +61,16 @@ function pickUnusedNumber(used, rng, min, max) {
   }
   used.add(value);
   return value;
+}
+
+function markTopReturnExportName(ast, name) {
+  if (!ast || typeof name !== "string" || !name) {
+    return;
+  }
+  if (!ast.__obf_top_return_export_names) {
+    ast.__obf_top_return_export_names = new Set();
+  }
+  ast.__obf_top_return_export_names.add(name);
 }
 
 function getFunctionStatements(node) {
@@ -128,6 +154,10 @@ function binaryExpression(operator, left, right) {
   return { type: "BinaryExpression", operator, left, right };
 }
 
+function unaryExpression(operator, argument) {
+  return { type: "UnaryExpression", operator, argument };
+}
+
 function logicalAnd(left, right, style) {
   if (style === "luaparse") {
     return { type: "LogicalExpression", operator: "and", left, right };
@@ -164,6 +194,10 @@ function callStatement(expression) {
 
 function returnStatement(args = []) {
   return { type: "ReturnStatement", arguments: args };
+}
+
+function booleanLiteral(value) {
+  return { type: "BooleanLiteral", value: Boolean(value) };
 }
 
 function cloneNode(node) {
@@ -251,6 +285,26 @@ function buildWhileStatement(condition, body, style) {
   return { type: "WhileStatement", condition, body: buildBlock(body, style) };
 }
 
+function buildRepeatStatement(condition, body, style) {
+  return { cffGenerated: true, type: "RepeatStatement", condition, body: buildBlock(body, style) };
+}
+
+function buildDoStatement(body, style) {
+  return { cffGenerated: true, type: "DoStatement", body: buildBlock(body, style) };
+}
+
+function buildForNumericStatement(variable, start, end, step, body, style) {
+  return {
+    cffGenerated: true,
+    type: "ForNumericStatement",
+    variable,
+    start,
+    end,
+    step,
+    body: buildBlock(body, style),
+  };
+}
+
 function buildOpaquePredicate(stateName, rng) {
   const subject = identifier(stateName);
   const template = rng.int(0, 3);
@@ -309,6 +363,59 @@ function buildModuloExpression(left, right, modulusValue) {
     binaryExpression("+", left, right),
     numericLiteral(modulusValue)
   );
+}
+
+function buildConstantNumberExpression(value, rng) {
+  if (value < 0) {
+    return numericLiteral(value);
+  }
+  const template = rng.int(0, 4);
+  if (template === 0) {
+    return numericLiteral(value);
+  }
+  if (template === 1) {
+    const salt = rng.int(3, 97);
+    return binaryExpression("-", numericLiteral(value + salt), numericLiteral(salt));
+  }
+  if (template === 2) {
+    const left = value > 0 ? rng.int(0, value) : 0;
+    return binaryExpression("+", numericLiteral(left), numericLiteral(value - left));
+  }
+  if (template === 3) {
+    const mod = value + rng.int(17, 101);
+    const mul = rng.int(2, 6);
+    return binaryExpression("%", numericLiteral(value + mod * mul), numericLiteral(mod));
+  }
+  const scale = rng.int(2, 9);
+  return binaryExpression("/", numericLiteral(value * scale), numericLiteral(scale));
+}
+
+function buildWovenNumber(value, rng, names = null) {
+  let expr = buildConstantNumberExpression(value, rng);
+  if (!names || rng.int(0, 2) === 0) {
+    return expr;
+  }
+  let noOp;
+  if (names.anchorTableName && names.anchorKeyName && names.anchorValueName) {
+    noOp = binaryExpression(
+      "-",
+      indexExpression(identifier(names.anchorTableName), identifier(names.anchorKeyName)),
+      identifier(names.anchorValueName)
+    );
+  } else {
+    const noOpNames = [
+      names.guardName,
+      names.trashAName,
+      names.trashBName,
+      names.stateName,
+    ].filter(Boolean);
+    const noOpName = noOpNames[rng.int(0, noOpNames.length - 1)];
+    noOp = binaryExpression("-", identifier(noOpName), identifier(noOpName));
+  }
+  if (rng.int(0, 1) === 0) {
+    return binaryExpression("+", expr, noOp);
+  }
+  return binaryExpression("-", expr, noOp);
 }
 
 function createLinearCodec(rng, scaleMin, scaleMax, biasMin, biasMax) {
@@ -482,10 +589,1082 @@ function prepareFlattenStatements(statements) {
   return { hoisted, rewritten };
 }
 
+function getBlockStatementsFromStatement(stmt) {
+  if (!stmt || !stmt.type) {
+    return [];
+  }
+  if (stmt.type === "IfStatement") {
+    const out = [];
+    if (Array.isArray(stmt.clauses)) {
+      stmt.clauses.forEach((clause) => {
+        if (clause && clause.body) {
+          out.push(...getBlockBody(clause.body));
+        }
+      });
+    }
+    if (stmt.elseBody) {
+      out.push(...getBlockBody(stmt.elseBody));
+    }
+    return out;
+  }
+  if (
+    stmt.type === "WhileStatement" ||
+    stmt.type === "RepeatStatement" ||
+    stmt.type === "ForNumericStatement" ||
+    stmt.type === "ForGenericStatement" ||
+    stmt.type === "DoStatement" ||
+    stmt.type === "FunctionDeclaration" ||
+    stmt.type === "FunctionExpression" ||
+    stmt.type === "TypeFunctionStatement" ||
+    stmt.type === "ExportTypeFunctionStatement"
+  ) {
+    return getBlockBody(stmt.body);
+  }
+  return [];
+}
+
+function getBlockBody(block) {
+  if (!block) {
+    return [];
+  }
+  if (Array.isArray(block)) {
+    return block;
+  }
+  if (Array.isArray(block.body)) {
+    return block.body;
+  }
+  return [];
+}
+
+function isLoopStatement(stmt) {
+  return Boolean(stmt && (
+    stmt.type === "WhileStatement" ||
+    stmt.type === "RepeatStatement" ||
+    stmt.type === "ForNumericStatement" ||
+    stmt.type === "ForGenericStatement"
+  ));
+}
+
+function statementTreeHasUnsafeControl(stmt, loopDepth = 0) {
+  if (!stmt || !stmt.type) {
+    return false;
+  }
+  if (stmt.type === "GotoStatement" || stmt.type === "LabelStatement") {
+    return true;
+  }
+  if ((stmt.type === "BreakStatement" || stmt.type === "ContinueStatement") && loopDepth <= 0) {
+    return true;
+  }
+  const nextLoopDepth = loopDepth + (isLoopStatement(stmt) ? 1 : 0);
+  const body = getBlockStatementsFromStatement(stmt);
+  if (!body.length) {
+    return false;
+  }
+  return body.some((child) => statementTreeHasUnsafeControl(child, nextLoopDepth));
+}
+
+function collectReferencedNames(node, out, options = {}) {
+  const ignoreLocalDeclarations = Boolean(options.ignoreLocalDeclarations);
+  const visit = (value, parent, key) => {
+    if (!value || typeof value !== "object") {
+      return;
+    }
+    if (Array.isArray(value)) {
+      value.forEach((item) => visit(item, parent, key));
+      return;
+    }
+    if (value.type === "Identifier") {
+      if (
+        ignoreLocalDeclarations &&
+        parent &&
+        (
+          (parent.type === "LocalStatement" && key === "variables") ||
+          (parent.type === "FunctionDeclaration" && parent.isLocal && key === "name") ||
+          (parent.type === "FunctionName" && key === "base")
+        )
+      ) {
+        return;
+      }
+      if (typeof value.name === "string") {
+        out.add(value.name);
+      }
+      return;
+    }
+    Object.keys(value).forEach((childKey) => {
+      if (
+        childKey === "loc" ||
+        childKey === "range" ||
+        childKey === "type" ||
+        childKey === "raw" ||
+        childKey === "value" ||
+        childKey.startsWith("__")
+      ) {
+        return;
+      }
+      visit(value[childKey], value, childKey);
+    });
+  };
+  visit(node, null, null);
+  return out;
+}
+
+function nodeReferencesAnyName(node, names) {
+  if (!names || !names.size) {
+    return false;
+  }
+  const refs = collectReferencedNames(node, new Set(), { ignoreLocalDeclarations: true });
+  for (const name of names) {
+    if (refs.has(name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function stripIdentifierForAssignment(node) {
+  const out = cloneNode(node);
+  if (out && typeof out === "object") {
+    delete out.annotation;
+    delete out.attributes;
+  }
+  return out;
+}
+
+function makeFunctionExpressionFromDeclaration(stmt, style) {
+  if (style === "luaparse") {
+    return {
+      type: "FunctionDeclaration",
+      identifier: null,
+      parameters: cloneNode(stmt.parameters || []),
+      isLocal: false,
+      body: cloneNode(stmt.body || []),
+    };
+  }
+  return {
+    type: "FunctionExpression",
+    parameters: cloneNode(stmt.parameters || []),
+    hasVararg: Boolean(stmt.hasVararg),
+    varargAnnotation: cloneNode(stmt.varargAnnotation || null),
+    returnType: cloneNode(stmt.returnType || null),
+    typeParameters: cloneNode(stmt.typeParameters || []),
+    body: cloneNode(stmt.body || { type: "Block", body: [] }),
+    attributes: cloneNode(stmt.attributes || []),
+  };
+}
+
+function getFunctionDeclarationLocalName(stmt) {
+  if (!stmt || stmt.type !== "FunctionDeclaration" || !stmt.isLocal || !stmt.name) {
+    return null;
+  }
+  if (stmt.name.base && typeof stmt.name.base.name === "string") {
+    if ((stmt.name.members && stmt.name.members.length) || stmt.name.method) {
+      return null;
+    }
+    return stmt.name.base.name;
+  }
+  if (stmt.identifier && typeof stmt.identifier.name === "string") {
+    return stmt.identifier.name;
+  }
+  return null;
+}
+
+function getParameterNames(fnNode) {
+  const out = new Set();
+  const params = Array.isArray(fnNode && fnNode.parameters) ? fnNode.parameters : [];
+  params.forEach((param) => {
+    if (param && param.type === "Identifier" && typeof param.name === "string") {
+      out.add(param.name);
+    }
+  });
+  return out;
+}
+
+function prepareWovenStatements(statements, fnNode, style) {
+  const staticPrefix = [];
+  const hoisted = [];
+  const steps = [];
+  const seenLocals = new Set(getParameterNames(fnNode));
+  const priorRefs = new Set();
+
+  for (const stmt of statements) {
+    if (!stmt || !stmt.type) {
+      continue;
+    }
+    if (stmt.cffGenerated) {
+      steps.push(cloneNode(stmt));
+      continue;
+    }
+    if (WOVEN_STATIC_STATEMENTS.has(stmt.type)) {
+      staticPrefix.push(cloneNode(stmt));
+      collectReferencedNames(stmt, priorRefs, { ignoreLocalDeclarations: true });
+      continue;
+    }
+    if (WOVEN_UNSAFE_TOP_LEVEL.has(stmt.type) || statementTreeHasUnsafeControl(stmt)) {
+      return null;
+    }
+    if (stmt.attributes && stmt.attributes.length) {
+      return null;
+    }
+    if (stmt.type === "LocalStatement") {
+      const variables = Array.isArray(stmt.variables) ? stmt.variables : [];
+      const localNames = new Set();
+      for (const variable of variables) {
+        const name = extractLocalName(variable);
+        if (!name || seenLocals.has(name) || priorRefs.has(name)) {
+          return null;
+        }
+        localNames.add(name);
+      }
+      if (nodeReferencesAnyName(stmt.init || [], localNames)) {
+        return null;
+      }
+      variables.forEach((variable) => {
+        const name = extractLocalName(variable);
+        seenLocals.add(name);
+        hoisted.push(cloneNode(variable));
+      });
+      if (Array.isArray(stmt.init) && stmt.init.length) {
+        steps.push({
+          type: "AssignmentStatement",
+          variables: variables.map((variable) => stripIdentifierForAssignment(variable)),
+          init: cloneNode(stmt.init),
+        });
+      }
+      collectReferencedNames(stmt.init || [], priorRefs, { ignoreLocalDeclarations: true });
+      continue;
+    }
+    if (stmt.type === "FunctionDeclaration" && stmt.isLocal) {
+      const name = getFunctionDeclarationLocalName(stmt);
+      if (!name || seenLocals.has(name) || priorRefs.has(name)) {
+        return null;
+      }
+      seenLocals.add(name);
+      hoisted.push(identifier(name));
+      steps.push({
+        type: "AssignmentStatement",
+        variables: [identifier(name)],
+        init: [makeFunctionExpressionFromDeclaration(stmt, style)],
+      });
+      collectReferencedNames(stmt.body || [], priorRefs, { ignoreLocalDeclarations: true });
+      continue;
+    }
+
+    steps.push(cloneNode(stmt));
+    collectReferencedNames(stmt, priorRefs, { ignoreLocalDeclarations: true });
+  }
+
+  return { staticPrefix, hoisted, steps };
+}
+
+function makeMultiLocalStatement(namesOrIdentifiers) {
+  return {
+    type: "LocalStatement",
+    variables: namesOrIdentifiers.map((value) => (
+      typeof value === "string" ? identifier(value) : cloneNode(value)
+    )),
+    init: [],
+  };
+}
+
+function makeMultiLocalInit(names, values) {
+  return {
+    type: "LocalStatement",
+    variables: names.map((name) => identifier(name)),
+    init: values,
+  };
+}
+
+function isTopLevelReturnStep(stmt) {
+  return stmt && stmt.type === "ReturnStatement";
+}
+
+function makeWovenNameFactory(rng, used) {
+  return makeShortNameFactory(rng, used, null, { minLength: 1, maxLength: 3 });
+}
+
+function hideTopReturnCallExpression(ast, ctx) {
+  if (!ast || ast.type !== "Chunk" || !Array.isArray(ast.body) || !ast.body.length) {
+    return;
+  }
+  const body = ast.body;
+  const ret = body[body.length - 1];
+  if (!ret || ret.type !== "ReturnStatement" || !Array.isArray(ret.arguments) || ret.arguments.length !== 1) {
+    return;
+  }
+  const call = ret.arguments[0];
+  if (!call || call.type !== "CallExpression" || !call.base || call.base.type !== "Identifier") {
+    return;
+  }
+
+  markTopReturnExportName(ast, call.base.name);
+  const used = collectIdentifierNames(ast);
+  const nameFor = makeWovenNameFactory(ctx.rng, used);
+  const keyName = nameFor("cff_top_return_key");
+  const boxName = nameFor("cff_top_return_box");
+
+  body.splice(
+    body.length - 1,
+    0,
+    localStatement(identifier(keyName), buildTableList([], "custom")),
+    localStatement(
+      identifier(boxName),
+      buildTableIndex([
+        { key: identifier(keyName), value: cloneNode(call.base) },
+      ], "custom")
+    )
+  );
+  call.base = indexExpression(identifier(boxName), identifier(keyName));
+}
+
+function buildWovenAnchorLookup(names) {
+  if (!names || !names.anchorTableName || !names.anchorKeyName) {
+    return identifier(names.guardName);
+  }
+  return indexExpression(identifier(names.anchorTableName), identifier(names.anchorKeyName));
+}
+
+function buildWovenAnchorValue(names) {
+  return identifier((names && names.anchorValueName) || (names && names.guardName));
+}
+
+function buildWovenOpaqueTrue(names, rng, style) {
+  const lookup = () => buildWovenAnchorLookup(names);
+  const value = () => buildWovenAnchorValue(names);
+  const template = rng.int(0, 4);
+  if (template === 0) {
+    return binaryExpression("==", lookup(), value());
+  }
+  if (template === 1) {
+    return unaryExpression(
+      "not",
+      binaryExpression("~=", lookup(), value())
+    );
+  }
+  if (template === 2) {
+    return logicalAnd(
+      binaryExpression("==", lookup(), value()),
+      unaryExpression(
+        "not",
+        binaryExpression("~=", buildWovenAnchorLookup(names), buildWovenAnchorValue(names))
+      ),
+      style
+    );
+  }
+  if (template === 3) {
+    return logicalAnd(
+      binaryExpression(">=", lookup(), value()),
+      binaryExpression("<=", lookup(), value()),
+      style
+    );
+  }
+  return binaryExpression(
+    "==",
+    binaryExpression("-", lookup(), value()),
+    numericLiteral(0)
+  );
+}
+
+function buildWovenOpaqueFalse(names, rng, style) {
+  const template = rng.int(0, 1);
+  if (template === 0) {
+    return binaryExpression(
+      "~=",
+      buildWovenAnchorLookup(names),
+      buildWovenAnchorValue(names)
+    );
+  }
+  return unaryExpression("not", buildWovenOpaqueTrue(names, rng, style));
+}
+
+function buildWovenNoiseBody(rng, names) {
+  const modA = rng.int(91, 263);
+  const modB = rng.int(127, 311);
+  const body = [
+    assignmentStatement(
+      identifier(names.trashAName),
+      buildModuloExpression(
+        binaryExpression("+", identifier(names.trashAName), identifier(names.stateName)),
+        numericLiteral(rng.int(3, 97)),
+        modA
+      )
+    ),
+    assignmentStatement(
+      identifier(names.trashBName),
+      buildModuloExpression(
+        binaryExpression("*", identifier(names.trashBName), numericLiteral(rng.int(2, 7))),
+        identifier(names.trashAName),
+        modB
+      )
+    ),
+  ];
+  if (rng.int(0, 1) === 1) {
+    body.reverse();
+  }
+  return body;
+}
+
+function buildWovenStateCondition(stateName, value, rng, names, style) {
+  const state = identifier(stateName);
+  const literal = () => buildWovenNumber(value, rng, names);
+  const template = rng.int(0, 4);
+  let condition;
+  if (template === 0) {
+    condition = binaryExpression("==", state, literal());
+  } else if (template === 1) {
+    condition = logicalAnd(
+      binaryExpression(">=", state, literal()),
+      binaryExpression("<=", identifier(stateName), literal()),
+      style
+    );
+  } else if (template === 2) {
+    condition = unaryExpression(
+      "not",
+      logicalOr(
+        binaryExpression("<", state, literal()),
+        binaryExpression(">", identifier(stateName), literal()),
+        style
+      )
+    );
+  } else if (template === 3) {
+    condition = logicalAnd(
+      binaryExpression("~=", state, buildWovenNumber(value + rng.int(1, 9), rng, names)),
+      binaryExpression("==", identifier(stateName), literal()),
+      style
+    );
+  } else {
+    const salt = rng.int(3, 43);
+    condition = binaryExpression(
+      "==",
+      binaryExpression("+", state, numericLiteral(salt)),
+      buildWovenNumber(value + salt, rng, names)
+    );
+  }
+  if (rng.int(0, 1) === 1) {
+    condition = logicalAnd(condition, buildWovenOpaqueTrue(names, rng, style), style);
+  }
+  return condition;
+}
+
+function buildWovenRangeCondition(stateName, pivot, rng, names, style) {
+  const condition = rng.int(0, 1) === 0
+    ? binaryExpression("<=", identifier(stateName), buildWovenNumber(pivot, rng, names))
+    : unaryExpression("not", binaryExpression(">", identifier(stateName), buildWovenNumber(pivot, rng, names)));
+  if (rng.int(0, 2) === 0) {
+    return logicalAnd(condition, buildWovenOpaqueTrue(names, rng, style), style);
+  }
+  return condition;
+}
+
+function isSimpleWovenExpression(expr) {
+  if (!expr || !expr.type) {
+    return false;
+  }
+  if (
+    expr.type === "Identifier" ||
+    expr.type === "NumericLiteral" ||
+    expr.type === "StringLiteral" ||
+    expr.type === "BooleanLiteral" ||
+    expr.type === "NilLiteral"
+  ) {
+    return true;
+  }
+  if (expr.type === "UnaryExpression") {
+    return isSimpleWovenExpression(expr.argument);
+  }
+  if (expr.type === "BinaryExpression" || expr.type === "LogicalExpression") {
+    return isSimpleWovenExpression(expr.left) && isSimpleWovenExpression(expr.right);
+  }
+  if (expr.type === "IndexExpression") {
+    return isSimpleWovenExpression(expr.base) && isSimpleWovenExpression(expr.index);
+  }
+  if (expr.type === "MemberExpression") {
+    return isSimpleWovenExpression(expr.base);
+  }
+  return false;
+}
+
+function isSingleAssignmentStatement(stmt) {
+  return Boolean(stmt &&
+    stmt.type === "AssignmentStatement" &&
+    Array.isArray(stmt.variables) &&
+    stmt.variables.length === 1 &&
+    Array.isArray(stmt.init) &&
+    stmt.init.length === 1 &&
+    isSimpleWovenExpression(stmt.variables[0]) &&
+    isSimpleWovenExpression(stmt.init[0]));
+}
+
+function isSingleCompoundAssignmentStatement(stmt) {
+  return Boolean(stmt &&
+    stmt.type === "CompoundAssignmentStatement" &&
+    isSimpleWovenExpression(stmt.variable) &&
+    isSimpleWovenExpression(stmt.value));
+}
+
+function buildMicroStateCondition(hName, value, rng, names, style) {
+  const h = identifier(hName);
+  const literal = () => buildWovenNumber(value, rng, names);
+  const template = rng.int(0, 3);
+  if (template === 0) {
+    return binaryExpression("==", h, literal());
+  }
+  if (template === 1) {
+    return unaryExpression(
+      "not",
+      logicalOr(
+        binaryExpression("<", h, literal()),
+        binaryExpression(">", identifier(hName), literal()),
+        style
+      )
+    );
+  }
+  if (template === 2) {
+    return logicalAnd(
+      binaryExpression("~=", h, buildWovenNumber(value + rng.int(3, 9), rng, names)),
+      binaryExpression("==", identifier(hName), literal()),
+      style
+    );
+  }
+  const salt = rng.int(2, 21);
+  return binaryExpression(
+    "==",
+    binaryExpression("+", h, numericLiteral(salt)),
+    buildWovenNumber(value + salt, rng, names)
+  );
+}
+
+function buildMicroDispatch(steps, hName, rng, names, style) {
+  const sorted = steps.slice().sort((a, b) => b.value - a.value);
+  const cases = sorted.map((step) => ({
+    condition: buildMicroStateCondition(hName, step.value, rng, names, style),
+    body: cloneNode(step.body),
+  }));
+  return buildIfStatement(cases, buildWovenNoiseBody(rng, names), style);
+}
+
+function wrapMicroWovenSteps(steps, locals, rng, names, style) {
+  const hName = names.nameFor("cff_woven_h");
+  const nextName = names.nameFor("cff_woven_micro_next");
+  const declared = [hName, nextName, ...locals];
+  const sortedValues = steps.map((step) => step.value).sort((a, b) => a - b);
+  const nextPairs = sortedValues.map((value, index) => ({
+    key: buildWovenNumber(value, rng, names),
+    value: buildWovenNumber(index < sortedValues.length - 1 ? sortedValues[index + 1] : -2, rng, names),
+  }));
+  const body = [
+    makeMultiLocalStatement(declared),
+    assignmentStatement(identifier(hName), buildWovenNumber(0, rng)),
+    assignmentStatement(identifier(nextName), buildTableIndex(nextPairs, style)),
+    buildWhileStatement(
+      binaryExpression(">", identifier(hName), buildWovenNumber(-1, rng)),
+      [
+        buildMicroDispatch(steps, hName, rng, names, style),
+        assignmentStatement(
+          identifier(hName),
+          logicalOr(
+            indexExpression(identifier(nextName), identifier(hName)),
+            buildWovenNumber(-2, rng, names),
+            style
+          )
+        ),
+      ],
+      style
+    ),
+  ];
+  return body;
+}
+
+function buildAssignmentMicroWoven(stmt, rng, names, style) {
+  if (!isSingleAssignmentStatement(stmt)) {
+    return null;
+  }
+  const target = stmt.variables[0];
+  const value = stmt.init[0];
+  if (target.type === "Identifier") {
+    const tmpName = names.nameFor("cff_woven_v");
+    return wrapMicroWovenSteps([
+      {
+        value: 0,
+        body: [assignmentStatement(identifier(tmpName), cloneNode(value))],
+      },
+      {
+        value: 1,
+        body: [assignmentStatement(cloneNode(target), identifier(tmpName))],
+      },
+      {
+        value: 2,
+        body: [assignmentStatement(identifier(tmpName), { type: "NilLiteral", value: null })],
+      },
+    ], [tmpName], rng, names, style);
+  }
+  if (target.type === "IndexExpression") {
+    const baseName = names.nameFor("cff_woven_r");
+    const keyName = names.nameFor("cff_woven_k");
+    const valueName = names.nameFor("cff_woven_v");
+    return wrapMicroWovenSteps([
+      {
+        value: 0,
+        body: [assignmentStatement(identifier(baseName), cloneNode(target.base))],
+      },
+      {
+        value: 1,
+        body: [assignmentStatement(identifier(keyName), cloneNode(target.index))],
+      },
+      {
+        value: 2,
+        body: [assignmentStatement(identifier(valueName), cloneNode(value))],
+      },
+      {
+        value: 3,
+        body: [assignmentStatement(indexExpression(identifier(baseName), identifier(keyName)), identifier(valueName))],
+      },
+      {
+        value: 4,
+        body: [
+          assignmentStatement(identifier(baseName), { type: "NilLiteral", value: null }),
+          assignmentStatement(identifier(keyName), { type: "NilLiteral", value: null }),
+          assignmentStatement(identifier(valueName), { type: "NilLiteral", value: null }),
+        ],
+      },
+    ], [baseName, keyName, valueName], rng, names, style);
+  }
+  if (target.type === "MemberExpression") {
+    const baseName = names.nameFor("cff_woven_r");
+    const valueName = names.nameFor("cff_woven_v");
+    return wrapMicroWovenSteps([
+      {
+        value: 0,
+        body: [assignmentStatement(identifier(baseName), cloneNode(target.base))],
+      },
+      {
+        value: 1,
+        body: [assignmentStatement(identifier(valueName), cloneNode(value))],
+      },
+      {
+        value: 2,
+        body: [assignmentStatement(
+          indexExpression(identifier(baseName), stringLiteral(target.identifier.name)),
+          identifier(valueName)
+        )],
+      },
+      {
+        value: 3,
+        body: [
+          assignmentStatement(identifier(baseName), { type: "NilLiteral", value: null }),
+          assignmentStatement(identifier(valueName), { type: "NilLiteral", value: null }),
+        ],
+      },
+    ], [baseName, valueName], rng, names, style);
+  }
+  return null;
+}
+
+function buildCompoundAssignmentMicroWoven(stmt, rng, names, style) {
+  if (!isSingleCompoundAssignmentStatement(stmt)) {
+    return null;
+  }
+  const operator = stmt.operator.slice(0, -1);
+  if (!operator) {
+    return null;
+  }
+  const target = stmt.variable;
+  const value = stmt.value;
+  if (target.type === "Identifier") {
+    const rhsName = names.nameFor("cff_woven_v");
+    const outName = names.nameFor("cff_woven_a");
+    return wrapMicroWovenSteps([
+      {
+        value: 0,
+        body: [assignmentStatement(identifier(rhsName), cloneNode(value))],
+      },
+      {
+        value: 1,
+        body: [assignmentStatement(identifier(outName), binaryExpression(operator, cloneNode(target), identifier(rhsName)))],
+      },
+      {
+        value: 2,
+        body: [assignmentStatement(cloneNode(target), identifier(outName))],
+      },
+      {
+        value: 3,
+        body: [
+          assignmentStatement(identifier(rhsName), { type: "NilLiteral", value: null }),
+          assignmentStatement(identifier(outName), { type: "NilLiteral", value: null }),
+        ],
+      },
+    ], [rhsName, outName], rng, names, style);
+  }
+  if (target.type === "IndexExpression") {
+    const baseName = names.nameFor("cff_woven_r");
+    const keyName = names.nameFor("cff_woven_k");
+    const rhsName = names.nameFor("cff_woven_v");
+    const outName = names.nameFor("cff_woven_a");
+    return wrapMicroWovenSteps([
+      {
+        value: 0,
+        body: [assignmentStatement(identifier(baseName), cloneNode(target.base))],
+      },
+      {
+        value: 1,
+        body: [assignmentStatement(identifier(keyName), cloneNode(target.index))],
+      },
+      {
+        value: 2,
+        body: [assignmentStatement(identifier(rhsName), cloneNode(value))],
+      },
+      {
+        value: 3,
+        body: [assignmentStatement(
+          identifier(outName),
+          binaryExpression(operator, indexExpression(identifier(baseName), identifier(keyName)), identifier(rhsName))
+        )],
+      },
+      {
+        value: 4,
+        body: [assignmentStatement(indexExpression(identifier(baseName), identifier(keyName)), identifier(outName))],
+      },
+      {
+        value: 5,
+        body: [
+          assignmentStatement(identifier(baseName), { type: "NilLiteral", value: null }),
+          assignmentStatement(identifier(keyName), { type: "NilLiteral", value: null }),
+          assignmentStatement(identifier(rhsName), { type: "NilLiteral", value: null }),
+          assignmentStatement(identifier(outName), { type: "NilLiteral", value: null }),
+        ],
+      },
+    ], [baseName, keyName, rhsName, outName], rng, names, style);
+  }
+  return null;
+}
+
+function buildMicroWovenStatement(stmt, rng, names, style) {
+  if (rng.int(0, 2) === 0) {
+    return null;
+  }
+  if (stmt.type === "AssignmentStatement") {
+    return buildAssignmentMicroWoven(stmt, rng, names, style);
+  }
+  if (stmt.type === "CompoundAssignmentStatement") {
+    return buildCompoundAssignmentMicroWoven(stmt, rng, names, style);
+  }
+  return null;
+}
+
+function wrapWovenBody(body, rng, names, style) {
+  let wrapped = cloneNode(body);
+  const falseBody = buildWovenNoiseBody(rng, names);
+  if (rng.int(0, 1) === 1) {
+    wrapped = [
+      buildIfStatement([
+        {
+          condition: buildWovenOpaqueTrue(names, rng, style),
+          body: wrapped,
+        },
+      ], falseBody, style),
+    ];
+  }
+
+  const template = rng.int(0, 3);
+  if (template === 0) {
+    return [
+      buildRepeatStatement(booleanLiteral(true), wrapped, style),
+    ];
+  }
+  if (template === 1) {
+    const loopName = names.nameFor("cff_woven_i");
+    return [
+      buildForNumericStatement(
+        identifier(loopName),
+        numericLiteral(rng.int(13, 47)),
+        numericLiteral(rng.int(63, 121)),
+        null,
+        [
+          buildIfStatement([
+            {
+              condition: buildWovenOpaqueTrue(names, rng, style),
+              body: wrapped,
+            },
+          ], buildWovenNoiseBody(rng, names), style),
+          { type: "BreakStatement" },
+        ],
+        style
+      ),
+    ];
+  }
+  if (template === 2) {
+    return [
+      buildDoStatement([
+        buildIfStatement([
+          {
+            condition: buildWovenOpaqueFalse(names, rng, style),
+            body: buildWovenNoiseBody(rng, names),
+          },
+          {
+            condition: buildWovenOpaqueTrue(names, rng, style),
+            body: wrapped,
+          },
+        ], buildWovenNoiseBody(rng, names), style),
+      ], style),
+    ];
+  }
+  return wrapped;
+}
+
+function buildWovenCaseBody(entry, rng, names, style) {
+  const body = [];
+  if (entry.kind === "fake") {
+    body.push(...buildWovenNoiseBody(rng, names));
+  } else {
+    const micro = buildMicroWovenStatement(entry.statement, rng, names, style);
+    if (micro && micro.length) {
+      body.push(...micro);
+    } else {
+      body.push(cloneNode(entry.statement));
+    }
+  }
+  if (!entry.terminal) {
+    body.push(
+      assignmentStatement(
+        identifier(names.stateName),
+        buildShardLookup(names.nextNames, identifier(names.stateName), style)
+      )
+    );
+  }
+  return wrapWovenBody(body, rng, names, style);
+}
+
+function buildWovenFallback(names, rng) {
+  return [
+    ...buildWovenNoiseBody(rng, names),
+    assignmentStatement(identifier(names.stateName), identifier(names.exitName)),
+  ];
+}
+
+function buildWovenDispatchTree(entries, rng, names, style, depth = 0) {
+  if (!entries.length) {
+    return buildWovenFallback(names, rng);
+  }
+  if (entries.length === 1) {
+    const entry = entries[0];
+    return [
+      buildIfStatement([
+        {
+          condition: buildWovenStateCondition(names.stateName, entry.value, rng, names, style),
+          body: buildWovenCaseBody(entry, rng, names, style),
+        },
+      ], buildWovenFallback(names, rng), style),
+    ];
+  }
+  if (depth > 7) {
+    const cases = entries.map((entry) => ({
+      condition: buildWovenStateCondition(names.stateName, entry.value, rng, names, style),
+      body: buildWovenCaseBody(entry, rng, names, style),
+    }));
+    return [
+      buildIfStatement(cases, buildWovenFallback(names, rng), style),
+    ];
+  }
+
+  const sorted = entries.slice().sort((a, b) => a.value - b.value);
+  const minPivotIndex = Math.max(1, Math.floor(sorted.length / 3));
+  const maxPivotIndex = Math.min(
+    sorted.length - 1,
+    Math.max(1, Math.ceil((sorted.length * 2) / 3))
+  );
+  const pivotIndex = rng.int(
+    minPivotIndex,
+    maxPivotIndex
+  );
+  const left = sorted.slice(0, pivotIndex);
+  const right = sorted.slice(pivotIndex);
+  const pivot = left[left.length - 1].value;
+  const condition = buildWovenRangeCondition(names.stateName, pivot, rng, names, style);
+  const leftBody = buildWovenDispatchTree(left, rng, names, style, depth + 1);
+  const rightBody = buildWovenDispatchTree(right, rng, names, style, depth + 1);
+  if (rng.int(0, 1) === 0) {
+    return [
+      buildIfStatement([
+        { condition, body: leftBody },
+      ], rightBody, style),
+    ];
+  }
+  return [
+    buildIfStatement([
+      {
+        condition: unaryExpression("not", condition),
+        body: rightBody,
+      },
+    ], leftBody, style),
+  ];
+}
+
+function buildWovenStatements(statements, ctx, style, usedNames = null) {
+  const { rng } = ctx;
+  const used = usedNames || collectIdentifierNames({ type: "Chunk", body: statements });
+  const nameFor = makeWovenNameFactory(rng, used);
+  const names = {
+    nameFor,
+    stateName: nameFor("cff_woven_state"),
+    exitName: nameFor("cff_woven_exit"),
+    guardName: nameFor("cff_woven_guard"),
+    trashAName: nameFor("cff_woven_trash"),
+    trashBName: nameFor("cff_woven_trash"),
+    nextNames: [nameFor("cff_woven_next"), nameFor("cff_woven_next")],
+    anchorKeyName: nameFor("cff_woven_anchor_key"),
+    anchorValueName: nameFor("cff_woven_anchor_value"),
+    anchorTableName: nameFor("cff_woven_anchor"),
+  };
+
+  const count = statements.length;
+  const fakeCount = count >= 4 ? rng.int(1, Math.max(1, Math.min(count, Math.floor(count * 0.75)))) : 0;
+  const usedStates = new Set();
+  const stateCodec = createLinearCodec(rng, 3, 11, 37, 211);
+  const rawStateValues = buildStateValues(count + fakeCount + 1, rng);
+  const encodedValues = rawStateValues.map((value) => stateCodec.encode(value));
+  encodedValues.forEach((value) => usedStates.add(value));
+  const realValues = encodedValues.slice(0, count);
+  const fakeValues = encodedValues.slice(count, count + fakeCount);
+  const exitValue = pickUnusedNumber(
+    usedStates,
+    rng,
+    stateCodec.encode((count + fakeCount + 5) * 3),
+    stateCodec.encode((count + fakeCount + 80) * 7)
+  );
+
+  const fakeEntries = [];
+  const fakeQueue = fakeValues.slice();
+  const realEntries = statements.map((stmt, index) => {
+    const terminal = isTopLevelReturnStep(stmt);
+    const semanticNext = index < statements.length - 1 ? realValues[index + 1] : exitValue;
+    let nextValue = semanticNext;
+    if (!terminal && fakeQueue.length && rng.int(0, 2) !== 0) {
+      const fakeValue = fakeQueue.shift();
+      nextValue = fakeValue;
+      fakeEntries.push({
+        kind: "fake",
+        value: fakeValue,
+        nextValue: semanticNext,
+        terminal: false,
+      });
+    }
+    return {
+      kind: "real",
+      value: realValues[index],
+      nextValue,
+      terminal,
+      statement: stmt,
+    };
+  });
+  while (fakeQueue.length) {
+    const fakeValue = fakeQueue.shift();
+    const targetIndex = rng.int(0, Math.max(0, realValues.length - 1));
+    fakeEntries.push({
+      kind: "fake",
+      value: fakeValue,
+      nextValue: realValues[targetIndex] || exitValue,
+      terminal: false,
+    });
+  }
+
+  const dispatchEntries = [...realEntries, ...fakeEntries];
+  rng.shuffle(dispatchEntries);
+  const nextPairs = [[], []];
+  dispatchEntries.forEach((entry) => {
+    if (entry.terminal) {
+      return;
+    }
+    nextPairs[rng.int(0, nextPairs.length - 1)].push({
+      key: buildWovenNumber(entry.value, rng, names),
+      value: buildWovenNumber(entry.nextValue, rng, names),
+    });
+  });
+  const loopBody = buildWovenDispatchTree(dispatchEntries, rng, names, style);
+  const loopCondition = logicalAnd(
+    binaryExpression("~=", identifier(names.stateName), identifier(names.exitName)),
+    buildWovenOpaqueTrue(names, rng, style),
+    style
+  );
+
+  return [
+    localStatement(
+      identifier(names.anchorKeyName),
+      buildTableList([], style)
+    ),
+    localStatement(
+      identifier(names.anchorValueName),
+      buildWovenNumber(rng.int(101, 997), rng)
+    ),
+    localStatement(
+      identifier(names.anchorTableName),
+      buildTableIndex([
+        {
+          key: identifier(names.anchorKeyName),
+          value: identifier(names.anchorValueName),
+        },
+      ], style)
+    ),
+    makeMultiLocalInit(
+      [names.stateName, names.exitName, names.guardName, names.trashAName, names.trashBName],
+      [
+        buildWovenNumber(realValues[0], rng, names),
+        buildWovenNumber(exitValue, rng, names),
+        buildWovenNumber(rng.int(17, 997), rng, names),
+        numericLiteral(0),
+        numericLiteral(0),
+      ]
+    ),
+    ...names.nextNames.map((name, idx) => localStatement(
+      identifier(name),
+      buildTableIndex(nextPairs[idx], style)
+    )),
+    buildWhileStatement(loopCondition, loopBody, style),
+  ];
+}
+
+function flattenFunctionWoven(node, ctx) {
+  if (node && node.cffGenerated) {
+    return;
+  }
+  if (shouldSkipForVm(node, ctx && ctx.options)) {
+    return;
+  }
+  const info = getFunctionStatements(node);
+  if (!info) {
+    return;
+  }
+  const { statements, style } = info;
+  const minStatements = ctx.options.cffOptions?.minStatements ?? 3;
+  if (!statements || statements.length < minStatements) {
+    return;
+  }
+
+  const prepared = prepareWovenStatements(statements, node, style);
+  if (!prepared || !prepared.steps.length) {
+    return;
+  }
+
+  const usedNames = collectIdentifierNames({ type: "Chunk", body: statements });
+  if (ctx && typeof ctx.getSSA === "function") {
+    const ssaRoot = ctx.getSSA();
+    const ssa = findSSAForNode(ssaRoot, node);
+    if (ssa) {
+      addNamesFromSSA(ssa, usedNames);
+    }
+  }
+  const flattened = [
+    ...prepared.staticPrefix,
+  ];
+  if (prepared.hoisted.length) {
+    flattened.push(makeMultiLocalStatement(prepared.hoisted));
+  }
+  flattened.push(...buildWovenStatements(prepared.steps, ctx, style, usedNames));
+  setFunctionStatements(node, flattened, style);
+}
+
 function buildFlattenedStatements(statements, ctx, style, usedNames = null) {
   const { rng } = ctx;
   const used = usedNames || collectIdentifierNames({ type: "Chunk", body: statements });
-  const nameFor = makeNameFactory(rng, used);
+  const nameFor = makeShortNameFactory(rng, used);
   const stateName = nameFor("cff_state");
   const exitName = nameFor("cff_exit");
   const nextNames = [nameFor("cff_next"), nameFor("cff_next")];
@@ -802,12 +1981,22 @@ function controlFlowFlatten(ast, ctx) {
   if (ctx && typeof ctx.getCFG === "function") {
     ctx.cfg = ctx.getCFG();
   }
+  const mode = ctx && ctx.options && ctx.options.cffOptions
+    ? ctx.options.cffOptions.mode
+    : "classic";
+  if (mode === "woven" && ctx && ctx.options && ctx.options.cffOptions?.hideTopReturnExpr) {
+    hideTopReturnCallExpression(ast, ctx);
+  }
   walk(ast, (node) => {
     if (!node || !node.type) {
       return;
     }
     if (node.type === "FunctionDeclaration" || node.type === "FunctionExpression") {
-      flattenFunction(node, ctx);
+      if (mode === "woven") {
+        flattenFunctionWoven(node, ctx);
+      } else {
+        flattenFunction(node, ctx);
+      }
     }
   });
 }

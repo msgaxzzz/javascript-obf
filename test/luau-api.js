@@ -9,10 +9,11 @@ function runVmDefaultOptionRegression() {
     vm: { enabled: true },
   });
 
-  assert.strictEqual(options.vm.decoyRuntime, true, "Luau VM should keep decoy runtime enabled by default");
-  assert.strictEqual(options.vm.symbolNoise, true, "Luau VM should keep symbol noise enabled by default");
-  assert.strictEqual(options.vm.semanticMisdirection, true, "Luau VM should keep semantic misdirection enabled by default");
-  assert.strictEqual(options.vm.dynamicCoupling, true, "Luau VM should keep dynamic coupling enabled by default");
+  assert.strictEqual(options.vm.mode, "compact", "Luau VM should default to compact mode");
+  assert.strictEqual(options.vm.decoyRuntime, false, "compact Luau VM should default decoy runtime off");
+  assert.strictEqual(options.vm.symbolNoise, false, "compact Luau VM should default symbol noise off");
+  assert.strictEqual(options.vm.semanticMisdirection, false, "compact Luau VM should default semantic misdirection off");
+  assert.strictEqual(options.vm.dynamicCoupling, false, "compact Luau VM should default dynamic coupling off");
 }
 
 async function runRawOptionsRegression() {

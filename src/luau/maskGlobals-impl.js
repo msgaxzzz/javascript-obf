@@ -1,4 +1,5 @@
 const { insertAtTop, walk } = require("./ast");
+const { makeShortNameFactory } = require("./names");
 const { getCachedSSAUsedNamesFromRoot } = require("./ssa-utils");
 
 const BASE_RESERVED = new Set(["_ENV", "_G"]);
@@ -113,22 +114,6 @@ function collectIdentifierNames(ast, ctx = null) {
     }
   });
   return used;
-}
-
-function makeName(rng, used, reserved) {
-  const firstAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
-  const restAlphabet = `${firstAlphabet}0123456789`;
-  let out = "";
-  while (!out || reserved.has(out) || used.has(out) || out.toLowerCase().includes("obf")) {
-    const length = rng.int(3, 8);
-    let name = firstAlphabet[rng.int(0, firstAlphabet.length - 1)];
-    for (let i = 1; i < length; i += 1) {
-      name += restAlphabet[rng.int(0, restAlphabet.length - 1)];
-    }
-    out = name;
-  }
-  used.add(out);
-  return out;
 }
 
 function envIndex(name, envAlias, ctx) {
@@ -370,6 +355,13 @@ function maskAssignmentTarget(target, scope, envAlias, reserved, ctx) {
   if (!target || typeof target !== "object") {
     return target;
   }
+  if (target.type === "Identifier" && shouldMask(target.name, scope, reserved)) {
+    tracePass(ctx, {
+      kind: "mask-global",
+      name: target.name,
+    });
+    return envIndex(target.name, envAlias, ctx);
+  }
   if (target.type === "MemberExpression") {
     target.base = maskExpression(target.base, scope, envAlias, reserved, ctx);
     return target;
@@ -597,9 +589,10 @@ function maskGlobalsLuau(ast, ctx) {
       getCachedSSAUsedNamesFromRoot(ctx.getSSA()).forEach((name) => used.add(name));
     }
     const reserved = new Set(NAME_RESERVED);
-    const envAlias = makeName(ctx.rng, used, reserved);
+    const nameFor = makeShortNameFactory(ctx.rng, used, reserved, { minLength: 1, maxLength: 3 });
+    const envAlias = nameFor("mask_env");
     reserved.add(envAlias);
-    const getfAlias = makeName(ctx.rng, used, reserved);
+    const getfAlias = nameFor("mask_getfenv");
     reserved.add(getfAlias);
     ast.__obf_env_alias_name = envAlias;
     ast.__obf_getf_alias_name = getfAlias;

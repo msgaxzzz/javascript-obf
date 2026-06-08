@@ -1,45 +1,5 @@
 const { insertAtTop, walk } = require("./ast");
-
-const LUA_KEYWORDS = new Set([
-  "and",
-  "break",
-  "do",
-  "else",
-  "elseif",
-  "end",
-  "false",
-  "for",
-  "function",
-  "goto",
-  "if",
-  "in",
-  "local",
-  "nil",
-  "not",
-  "or",
-  "repeat",
-  "return",
-  "then",
-  "true",
-  "until",
-  "while",
-]);
-
-function makeName(rng, used) {
-  const firstAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
-  const restAlphabet = `${firstAlphabet}0123456789`;
-  let out = "";
-  while (!out || LUA_KEYWORDS.has(out) || used.has(out) || out.toLowerCase().includes("obf")) {
-    const length = rng.int(3, 8);
-    let name = firstAlphabet[rng.int(0, firstAlphabet.length - 1)];
-    for (let i = 1; i < length; i += 1) {
-      name += restAlphabet[rng.int(0, restAlphabet.length - 1)];
-    }
-    out = name;
-  }
-  used.add(out);
-  return out;
-}
+const { makeShortNameFactory } = require("./names");
 
 function luaString(value) {
   const text = String(value);
@@ -80,17 +40,18 @@ function luaHiddenIndex(baseExpr, key) {
 
 function buildRuntime({ lock, rng }) {
   const used = new Set();
-  const failName = makeName(rng, used);
-  const envResolverName = makeName(rng, used);
-  const checkName = makeName(rng, used);
-  const rootName = makeName(rng, used);
-  const typeName = makeName(rng, used);
-  const charName = makeName(rng, used);
-  const getfenvName = makeName(rng, used);
-  const getmetatableName = makeName(rng, used);
-  const setmetatableName = makeName(rng, used);
-  const pcallName = makeName(rng, used);
-  const debugName = makeName(rng, used);
+  const nameFor = makeShortNameFactory(rng, used);
+  const failName = nameFor();
+  const envResolverName = nameFor();
+  const checkName = nameFor();
+  const rootName = nameFor();
+  const typeName = nameFor();
+  const charName = nameFor();
+  const getfenvName = nameFor();
+  const getmetatableName = nameFor();
+  const setmetatableName = nameFor();
+  const pcallName = nameFor();
+  const debugName = nameFor();
   const functionTag = luaByteString("function");
   const tableTag = luaByteString("table");
   const lockedValue = luaByteString("locked");
@@ -104,20 +65,20 @@ function buildRuntime({ lock, rng }) {
   const hiddenPcall = luaHiddenIndex(rootName, "pcall");
   const hiddenDebug = luaHiddenIndex(rootName, "debug");
   const hiddenChar = luaHiddenIndex(hiddenString, "char");
-  const envLocalName = makeName(rng, used);
-  const getfLocalName = makeName(rng, used);
-  const getmtLocalName = makeName(rng, used);
-  const mtLocalName = makeName(rng, used);
-  const rootLocalName = makeName(rng, used);
-  const dbgLocalName = makeName(rng, used);
-  const gethookLocalName = makeName(rng, used);
-  const okLocalName = makeName(rng, used);
-  const hookLocalName = makeName(rng, used);
-  const lockEnvName = makeName(rng, used);
-  const setmtLocalName = makeName(rng, used);
-  const envLockLocalName = makeName(rng, used);
-  const mtLockLocalName = makeName(rng, used);
-  const okSetmtLocalName = makeName(rng, used);
+  const envLocalName = nameFor();
+  const getfLocalName = nameFor();
+  const getmtLocalName = nameFor();
+  const mtLocalName = nameFor();
+  const rootLocalName = nameFor();
+  const dbgLocalName = nameFor();
+  const gethookLocalName = nameFor();
+  const okLocalName = nameFor();
+  const hookLocalName = nameFor();
+  const lockEnvName = nameFor();
+  const setmtLocalName = nameFor();
+  const envLockLocalName = nameFor();
+  const mtLockLocalName = nameFor();
+  const okSetmtLocalName = nameFor();
   return [
     "do",
     `  local ${rootName} = _G`,

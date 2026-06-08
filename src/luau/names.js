@@ -128,7 +128,64 @@ function makeNameFactory(rng, used = new Set(), extraReserved = null, options = 
   };
 }
 
+function countNamesOfLength(length) {
+  if (length <= 1) {
+    return FIRST_ALPHABET.length;
+  }
+  return FIRST_ALPHABET.length * (REST_ALPHABET.length ** (length - 1));
+}
+
+function nameAtLengthIndex(length, index) {
+  if (length <= 1) {
+    return FIRST_ALPHABET[index % FIRST_ALPHABET.length];
+  }
+  let restIndex = index % (REST_ALPHABET.length ** (length - 1));
+  const firstIndex = Math.floor(index / (REST_ALPHABET.length ** (length - 1))) % FIRST_ALPHABET.length;
+  let name = FIRST_ALPHABET[firstIndex];
+  const chars = new Array(length - 1);
+  for (let pos = chars.length - 1; pos >= 0; pos -= 1) {
+    chars[pos] = REST_ALPHABET[restIndex % REST_ALPHABET.length];
+    restIndex = Math.floor(restIndex / REST_ALPHABET.length);
+  }
+  return name + chars.join("");
+}
+
+function makeShortNameFactory(_rng, used = new Set(), extraReserved = null, options = {}) {
+  const reserved = new Set([...LUA_KEYWORDS, ...DEFAULT_RESERVED]);
+  if (extraReserved) {
+    for (const name of extraReserved) {
+      reserved.add(name);
+    }
+  }
+  const minLength = options.minLength ?? 1;
+  const preferredMaxLength = options.maxLength ?? 3;
+  let length = minLength;
+  let index = 0;
+
+  return (_prefix) => {
+    while (true) {
+      const count = countNamesOfLength(length);
+      if (index >= count) {
+        length += 1;
+        index = 0;
+        continue;
+      }
+      const name = nameAtLengthIndex(length, index);
+      index += 1;
+      if (!reserved.has(name) && !used.has(name) && !name.toLowerCase().includes("obf")) {
+        used.add(name);
+        return name;
+      }
+      if (length >= preferredMaxLength && index >= count) {
+        length += 1;
+        index = 0;
+      }
+    }
+  };
+}
+
 module.exports = {
   collectIdentifierNames,
   makeNameFactory,
+  makeShortNameFactory,
 };

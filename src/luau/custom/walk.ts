@@ -1,5 +1,5 @@
 // @ts-nocheck
-const { traverse } = require("./traverse.ts");
+const { traverse } = require("./traverse");
 
 function walk(node, visitor) {
   traverse(node, (value, parent, key, index) => {

@@ -219,6 +219,101 @@ async function runCustom() {
   assert.ok(hasPrintCall(ast), "custom: print call should remain global");
 }
 
+async function runShortNameOrderRegression() {
+  const names = Array.from({ length: 60 }, (_, index) => `v${index}`);
+  const shortNameSource = [
+    "local function demo()",
+    ...names.map((name, index) => `  local ${name} = ${index}`),
+    `  print(${names.slice(0, 3).join(" + ")})`,
+    "end",
+    "demo()",
+  ].join("\n");
+
+  const { code } = await obfuscateLuau(shortNameSource, {
+    lang: "luau",
+    luauParser: "custom",
+    rename: true,
+    strings: false,
+    cff: false,
+    dead: false,
+    numbers: false,
+    renameOptions: { maskGlobals: false },
+    seed: "rename-short-name-order",
+  });
+  const ast = parseCustom(code);
+  const locals = collectLocalNames(ast);
+  assert.ok(locals.has("b"), "Luau rename should use one-character names first");
+  assert.ok(locals.has("_"), "Luau rename should exhaust one-character names before two-character names");
+  assert.ok(locals.has("aa"), "Luau rename should continue into two-character names after one-character names");
+  assert.ok(locals.has("ah"), "Luau rename should keep allocating short two-character names without a three-character cap");
+  assert.ok(!locals.has("v0"), "original local names should be renamed");
+  assert.strictEqual(runLuau(code), "3", "short-name Luau rename should preserve behavior");
+}
+
+async function runTopReturnNamePreserveRegression() {
+  const sourceWithTopReturn = [
+    "local function score()",
+    "  local total = 7",
+    "  return total",
+    "end",
+    "local function wrapper()",
+    "  local score = 5",
+    "  return score",
+    "end",
+    "print(wrapper())",
+    "return score",
+  ].join("\n");
+
+  const { code } = await obfuscateLuau(sourceWithTopReturn, {
+    lang: "luau",
+    luauParser: "custom",
+    rename: true,
+    strings: false,
+    cff: false,
+    dead: false,
+    vm: false,
+    constArray: false,
+    numbers: false,
+    proxifyLocals: false,
+    padFooter: false,
+    wrap: false,
+    renameOptions: {
+      maskGlobals: false,
+    },
+    seed: "rename-top-return-preserve",
+  });
+
+  parseCustom(code);
+  assert.ok(/\blocal function score\b/.test(code), "top-level returned function name should be preserved by default");
+  assert.ok(/\breturn score\b/.test(code), "top-level return should keep the exported name by default");
+  assert.ok(!/\blocal score\s*=/.test(code), "non-exported nested locals with the same name should still be renamed");
+  assert.strictEqual(runLuau(code), "5", "top-level return name preservation should preserve script behavior");
+
+  const { code: optOutCode } = await obfuscateLuau(sourceWithTopReturn, {
+    lang: "luau",
+    luauParser: "custom",
+    rename: true,
+    strings: false,
+    cff: false,
+    dead: false,
+    vm: false,
+    constArray: false,
+    numbers: false,
+    proxifyLocals: false,
+    padFooter: false,
+    wrap: false,
+    renameOptions: {
+      maskGlobals: false,
+      preserveTopReturnNames: false,
+    },
+    seed: "rename-top-return-opt-out",
+  });
+
+  parseCustom(optOutCode);
+  assert.ok(!/\blocal function score\b/.test(optOutCode), "top-level return name preservation should be opt-out");
+  assert.strictEqual(runLuau(optOutCode), "5", "opted-out top-level return rename should remain internally consistent");
+}
+
 async function runRenameMembersWithStrings() {
   const sourceWithMemberCalls = [
     "local t = {}",
@@ -933,6 +1028,8 @@ async function runMetatableDirectFieldRoundtrip() {
   runExternalServiceMemberGuard();
   runLocalTableMemberRename();
   await runCustom();
+  await runShortNameOrderRegression();
+  await runTopReturnNamePreserveRegression();
   await runRenameMembersWithStrings();
   await runExternalPayloadKeyGuard();
   await runMetatableMethodRenameRoundtrip();

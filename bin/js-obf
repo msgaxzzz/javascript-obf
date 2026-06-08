@@ -14,6 +14,7 @@ Usage:
 Options:
   -o, --output <file>        Output file
   --preset <high|balanced|low>  Preset strength (default: high)
+  --scheme <classic|stealth|runtime>  JS obfuscation scheme (default: classic)
   --no-rename                Disable identifier renaming
   --rename-globals           Rename global bindings (Luau only)
   --no-rename-globals        Skip renaming globals
@@ -63,9 +64,10 @@ Options:
   --pad-footer-blocks <n>       Number of fake blocks (Luau only, default 2)
   --no-cff                   Disable control flow flattening
   --cff-downlevel            Allow CFF to downlevel let/const to var
-  --cff-mode <vm|classic>    CFF strategy for Luau (default: classic)
+  --cff-mode <vm|classic|woven>  CFF strategy for Luau (default: classic)
   --cff-opaque               Enable opaque predicates (default: on)
   --no-cff-opaque            Disable opaque predicates
+  --cff-hide-top-return-expr Hide simple top-level return call targets (Luau woven CFF)
   --no-dead                  Disable dead code injection
   --vm                       Enable VM virtualization (see README limits)
   --vm-mode <compact|balanced|max>  Luau VM behavior profile (default: compact when VM is enabled)
@@ -110,6 +112,7 @@ Options:
   --no-vm-fake-edges         Disable fake edges in sparse Luau dispatch graph
   --vm-block-dispatch         Use block-dispatch VM (Luau, hides bytecode table)
   --no-vm-block-dispatch      Force table-driven VM
+  --vm-shell-style <default|packed>  Luau VM shell style
   --vm-downlevel             Allow VM to downlevel let/const to var
   --vm-debug                 Log Luau VM compile failures
   --anti-hook                Enable anti-hook runtime guard
@@ -149,6 +152,11 @@ function parseArgs(argv) {
     }
     if (arg === "--preset") {
       options.preset = args[i + 1] || "high";
+      i += 1;
+      continue;
+    }
+    if (arg === "--scheme" || arg === "--js-scheme") {
+      options.scheme = args[i + 1] || "classic";
       i += 1;
       continue;
     }
@@ -386,6 +394,11 @@ function parseArgs(argv) {
       options.vmBlockDispatch = false;
       continue;
     }
+    if (arg === "--vm-shell-style") {
+      options.vmShellStyle = args[i + 1];
+      i += 1;
+      continue;
+    }
     if (arg === "--vm-downlevel") {
       options.vmDownlevel = true;
       continue;
@@ -618,6 +631,10 @@ function parseArgs(argv) {
       options.cffOpaque = false;
       continue;
     }
+    if (arg === "--cff-hide-top-return-expr") {
+      options.cffHideTopReturnExpr = true;
+      continue;
+    }
     if (arg === "--no-dead") {
       options.dead = false;
       continue;
@@ -635,6 +652,50 @@ function parseArgs(argv) {
   }
 
   return { options, positional };
+}
+
+function setDefined(target, key, value) {
+  if (value !== undefined) {
+    target[key] = value;
+  }
+}
+
+function buildVmOptions(options) {
+  const vm = {};
+  if (options.vm !== undefined) {
+    vm.enabled = Boolean(options.vm);
+  }
+  setDefined(vm, "mode", options.vmMode);
+  setDefined(vm, "opcodeEncoding", options.vmOpcodeEncoding);
+  setDefined(vm, "include", options.vmInclude);
+  setDefined(vm, "layers", options.vmLayers);
+  setDefined(vm, "topLevel", options.vmTopLevel);
+  setDefined(vm, "opcodeShuffle", options.vmOpcodeShuffle);
+  setDefined(vm, "fakeOpcodes", options.vmFakeOpcodes);
+  setDefined(vm, "bytecodeEncrypt", options.vmBytecode);
+  setDefined(vm, "constsEncrypt", options.vmConsts);
+  setDefined(vm, "constsEncoding", options.vmConstsEncoding);
+  setDefined(vm, "constsSplit", options.vmConstsSplit);
+  setDefined(vm, "constsSplitSize", options.vmConstsSplitSize);
+  setDefined(vm, "runtimeKey", options.vmRuntimeKey);
+  setDefined(vm, "runtimeSplit", options.vmRuntimeSplit);
+  setDefined(vm, "decoyRuntime", options.vmDecoyRuntime);
+  setDefined(vm, "decoyProbability", options.vmDecoyProbability);
+  setDefined(vm, "decoyStrings", options.vmDecoyStrings);
+  setDefined(vm, "symbolNoise", options.vmSymbolNoise);
+  setDefined(vm, "instructionFusion", options.vmInstructionFusion);
+  setDefined(vm, "semanticMisdirection", options.vmSemanticMisdirection);
+  setDefined(vm, "dynamicCoupling", options.vmDynamicCoupling);
+  setDefined(vm, "blockDispatch", options.vmBlockDispatch);
+  setDefined(vm, "shellStyle", options.vmShellStyle);
+  setDefined(vm, "dispatchGraph", options.vmDispatchGraph);
+  setDefined(vm, "stackProtocol", options.vmStackProtocol);
+  setDefined(vm, "isaPolymorph", options.vmIsaPolymorph);
+  setDefined(vm, "fakeEdges", options.vmFakeEdges);
+  setDefined(vm, "numericStyle", options.vmNumericStyle);
+  setDefined(vm, "downlevel", options.vmDownlevel);
+  setDefined(vm, "debug", options.vmDebug);
+  return Object.keys(vm).length ? vm : undefined;
 }
 
 function readInput(file) {
@@ -669,6 +730,7 @@ async function main() {
         : "js";
   const lang = options.lang || inferredLang;
   const source = readInput(inputPath);
+  const vmOptions = buildVmOptions(options);
   const outputPath = options.output
     ? options.output
     : inputPath === "-"
@@ -682,6 +744,7 @@ async function main() {
 
   const result = await obfuscate(source, {
     preset: options.preset,
+    scheme: options.scheme,
     rename: options.rename,
     strings: options.strings,
     stringsOptions: {
@@ -723,6 +786,7 @@ async function main() {
       downlevel: options.cffDownlevel,
       mode: options.cffMode,
       opaque: options.cffOpaque,
+      hideTopReturnExpr: options.cffHideTopReturnExpr,
     },
     dead: options.dead,
     antiHook: options.antiHook
@@ -731,38 +795,7 @@ async function main() {
           lock: Boolean(options.antiHookLock),
         }
       : undefined,
-    vm: {
-      enabled: Boolean(options.vm),
-      mode: options.vmMode,
-      opcodeEncoding: options.vmOpcodeEncoding,
-      include: options.vmInclude,
-      layers: options.vmLayers,
-      topLevel: options.vmTopLevel,
-      opcodeShuffle: options.vmOpcodeShuffle,
-      fakeOpcodes: options.vmFakeOpcodes,
-      bytecodeEncrypt: options.vmBytecode,
-      constsEncrypt: options.vmConsts,
-      constsEncoding: options.vmConstsEncoding,
-      constsSplit: options.vmConstsSplit,
-      constsSplitSize: options.vmConstsSplitSize,
-      runtimeKey: options.vmRuntimeKey,
-      runtimeSplit: options.vmRuntimeSplit,
-      decoyRuntime: options.vmDecoyRuntime,
-      decoyProbability: options.vmDecoyProbability,
-      decoyStrings: options.vmDecoyStrings,
-      symbolNoise: options.vmSymbolNoise,
-      instructionFusion: options.vmInstructionFusion,
-      semanticMisdirection: options.vmSemanticMisdirection,
-      dynamicCoupling: options.vmDynamicCoupling,
-      blockDispatch: options.vmBlockDispatch,
-      dispatchGraph: options.vmDispatchGraph,
-      stackProtocol: options.vmStackProtocol,
-      isaPolymorph: options.vmIsaPolymorph,
-      fakeEdges: options.vmFakeEdges,
-      numericStyle: options.vmNumericStyle,
-      downlevel: options.vmDownlevel,
-      debug: options.vmDebug,
-    },
+    vm: vmOptions,
     seed: options.seed,
     ecma: options.ecma,
     sourceMap: options.sourcemap,

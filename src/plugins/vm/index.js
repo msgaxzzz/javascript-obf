@@ -223,7 +223,7 @@ function createRuntimeBundle(ctx) {
   }
 
   const wrappedSource = `${runtimeSource}\nreturn { ${exports.join(", ")} };`;
-  const cacheKey = `__vm_rt_${ctx.rng.int(1, 1e9)}`;
+  const cacheKey = ctx.nameGen.next();
   const bundle = {
     runtimeSource: wrappedSource,
     cacheKey,
@@ -330,9 +330,9 @@ function applyVmToFunction(fnPath, ctx) {
   }
 
   const envId = ctx.t.identifier(ctx.nameGen.next());
-  const envThisKey = `__vm_this_${ctx.rng.int(1, 1e9)}`;
-  const envArgsKey = `__vm_args_${ctx.rng.int(1, 1e9)}`;
-  const envNewTargetKey = `__vm_new_target_${ctx.rng.int(1, 1e9)}`;
+  const envThisKey = ctx.nameGen.next();
+  const envArgsKey = ctx.nameGen.next();
+  const envNewTargetKey = ctx.nameGen.next();
 
   rewriteClosureRefs(fnPath, ctx, envId, envThisKey, envArgsKey);
 
@@ -519,7 +519,9 @@ function vmPlugin(ast, ctx) {
           if (!shouldVirtualize(fnPath, options.vm)) {
             return;
           }
-          applyVmToFunction(fnPath, ctx);
+          if (applyVmToFunction(fnPath, ctx)) {
+            fnPath.skip();
+          }
         },
       });
     },

@@ -159,10 +159,11 @@ function printStatement(stmt, indent, compact, tracker = null) {
       const names = stmt.variables.map(printTypedIdentifier).join(", ");
       let init = "";
       if (stmt.init && stmt.init.length) {
-        const startColumn = indent * 2 + `local ${names} = `.length;
+        const keyword = stmt.isConst ? "const" : "local";
+        const startColumn = indent * 2 + `${keyword} ${names} = `.length;
         init = ` = ${printExpressionListTracked(stmt.init, tracker, tracker ? tracker.currentLine : 0, startColumn)}`;
       }
-      return `local ${names}${init}`;
+      return `${stmt.isConst ? "const" : "local"} ${names}${init}`;
     }
     case "AssignmentStatement": {
       const line = tracker ? tracker.currentLine : 0;
@@ -183,7 +184,7 @@ function printStatement(stmt, indent, compact, tracker = null) {
       return printExpression(stmt.expression);
     case "FunctionDeclaration": {
       const params = stmt.parameters.map(printTypedIdentifier).join(", ");
-      const header = stmt.isLocal ? "local function" : "function";
+      const header = stmt.isConst ? "const function" : stmt.isLocal ? "local function" : "function";
       const name = printFunctionName(stmt.name);
       const args = buildVarargParams(params, stmt.hasVararg, stmt.varargAnnotation);
       const typeParams = printTypeParameters(stmt.typeParameters);
@@ -371,9 +372,62 @@ function printStatement(stmt, indent, compact, tracker = null) {
     }
     case "DeclareVariableStatement":
       return `declare ${printIdentifier(stmt.name)}: ${printType(stmt.annotation)}`;
+    case "DeclareExternTypeStatement":
+      return printDeclareExternTypeStatement(stmt, indent, compact, tracker);
     default:
       throw makeDiagnosticErrorFromNode(`Unsupported statement: ${stmt.type}`, stmt);
   }
+}
+
+function printDeclareExternTypeStatement(stmt, indent, compact, tracker = null) {
+  const superText = stmt.superName ? ` extends ${printIdentifier(stmt.superName)}` : "";
+  const members = [...(stmt.props || [])];
+  if (stmt.indexer) {
+    members.push(stmt.indexer);
+  }
+  if (stmt.declarationKind === "extern") {
+    const head = `declare extern type ${printIdentifier(stmt.name)}${superText}`;
+    if (!stmt.hasBody && members.length === 0) {
+      return head;
+    }
+    if (compact) {
+      const body = members.map(printDeclareExternTypeMember).join("; ");
+      return `${head} with ${body ? `${body} ` : ""}end`;
+    }
+    const lines = [`${head} with`];
+    for (const member of members) {
+      lines.push(`${"  ".repeat(indent + 1)}${printDeclareExternTypeMember(member)}`);
+    }
+    lines.push(`${"  ".repeat(indent)}end`);
+    return lines.join("\n" + "  ".repeat(indent));
+  }
+
+  const head = `declare class ${printIdentifier(stmt.name)}${superText}`;
+  if (compact) {
+    const body = members.map(printDeclareExternTypeMember).join("; ");
+    return `${head} ${body ? `${body} ` : ""}end`;
+  }
+  const lines = [head];
+  for (const member of members) {
+    lines.push(`${"  ".repeat(indent + 1)}${printDeclareExternTypeMember(member)}`);
+  }
+  lines.push(`${"  ".repeat(indent)}end`);
+  return lines.join("\n" + "  ".repeat(indent));
+}
+
+function printDeclareExternTypeMember(member) {
+  const access = member.access ? `${member.access} ` : "";
+  if (member.kind === "indexer") {
+    return `[${access}${printType(member.key)}]: ${printType(member.value)}`;
+  }
+  if (member.kind === "method") {
+    const params = member.parameters.map(printTypedIdentifier).join(", ");
+    const args = buildVarargParams(params, member.hasVararg, member.varargAnnotation);
+    const typeParams = printTypeParameters(member.typeParameters);
+    const returnType = member.returnType ? `: ${printType(member.returnType)}` : "";
+    return `function ${printIdentifier(member.name)}${typeParams}(${args})${returnType}`;
+  }
+  return `${access}${printIdentifier(member.name)}: ${printType(member.value)}`;
 }
 
 function getExpressionPrecedence(expr) {

@@ -7,9 +7,7 @@ const {
   buildOpcodeMap,
 } = require("./vm/opcodes");
 const {
-  VM_NAME_KEYWORDS,
-  VM_NAME_RESERVED,
-  makeVmHelperName,
+  makeVmNameFactory,
   makeVmCharExpr,
   createSharedVmRuntime,
   buildSharedVmRuntimePreludeSource,
@@ -96,6 +94,7 @@ function renameGeneratedVmAst(vmAst, rng, reservedNames = null, renameOptions = 
         renameGlobals: false,
         renameMembers: Boolean(renameOptions && renameOptions.renameMembers),
         homoglyphs: Boolean(renameOptions && renameOptions.homoglyphs),
+        preserveTopReturnNames: false,
         reserved: [...reserved],
       },
     },
@@ -1153,12 +1152,6 @@ function liftNestedVmCallbacks(ast, ctx, style) {
 }
 
 function canVirtualizeFunction(fnNode, style) {
-  if (hasNestedFunction(fnNode)) {
-    return false;
-  }
-  if (hasVararg(fnNode, style)) {
-    return false;
-  }
   let unsupported = false;
   walk(fnNode, (node) => {
     if (unsupported || !node || !node.type) {
@@ -1168,9 +1161,6 @@ function canVirtualizeFunction(fnNode, style) {
       return;
     }
     switch (node.type) {
-      case "VarargLiteral":
-        unsupported = true;
-        return;
       default:
         return;
     }
@@ -1313,8 +1303,7 @@ function buildVmSource(
   const blockDispatch = Boolean(vmOptions.blockDispatch);
   const useBytecodeStream = !blockDispatch && vmOptions.bytecodeEncrypt !== false;
   const initValues = Array.isArray(program.localInitValues) ? program.localInitValues : paramNames;
-  const localsInit = (initValues || []).map((name) => (name ? name : "nil"));
-  const localsTable = `{ ${localsInit.join(", ")} }`;
+  const setTargets = Array.isArray(program.localSetTargets) ? program.localSetTargets : initValues;
   const seedPieces = seedState ? seedState.pieces : [];
   const keyMaskPieces = keySchedule ? keySchedule.maskPieces : null;
   const keyEncoded = keySchedule ? keySchedule.encoded : null;
@@ -1322,19 +1311,6 @@ function buildVmSource(
   const opEncoded = opcodeInfo ? opcodeInfo.encoded : null;
   const opKeyPieces = opcodeInfo ? opcodeInfo.keyPieces : null;
   const opEncodingMode = opcodeInfo ? opcodeInfo.encodingMode : "mask";
-  const semanticMisdirection = vmOptions.semanticMisdirection !== false;
-  const misleadingNamePool = [
-    "check_user_auth",
-    "validate_license_key",
-    "process_payment_token",
-    "verify_subscription",
-    "audit_billing_state",
-    "sync_entitlement_cache",
-    "authorize_purchase_flow",
-    "validate_invoice_nonce",
-    "load_secure_profile",
-    "refresh_payment_session",
-  ];
   const nameUsed = new Set();
   if (reservedNames && typeof reservedNames.forEach === "function") {
     reservedNames.forEach((name) => {
@@ -1343,30 +1319,8 @@ function buildVmSource(
       }
     });
   }
-  const firstAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  const restAlphabet = `${firstAlphabet}0123456789`;
-  const LUA_KEYWORDS = VM_NAME_KEYWORDS;
-  const RESERVED_NAMES = VM_NAME_RESERVED;
-  const makeUniqueName = (allowSemanticMisdirection = semanticMisdirection) => {
-    let out = "";
-    while (!out || LUA_KEYWORDS.has(out) || RESERVED_NAMES.has(out) || nameUsed.has(out) || out.toLowerCase().includes("obf")) {
-      if (allowSemanticMisdirection && rng.bool(0.38)) {
-        const base = rng.pick(misleadingNamePool);
-        out = rng.bool(0.72) ? `${base}_${rng.int(11, 9999)}` : base;
-        continue;
-      }
-      const length = rng.int(4, 8);
-      let randomName = firstAlphabet[rng.int(0, firstAlphabet.length - 1)];
-      for (let i = 1; i < length; i += 1) {
-        randomName += restAlphabet[rng.int(0, restAlphabet.length - 1)];
-      }
-      out = randomName;
-    }
-    nameUsed.add(out);
-    return out;
-  };
-  const makeName = () => makeUniqueName(true);
-  const makeVmHelperAliasName = () => makeUniqueName(false);
+  const makeName = makeVmNameFactory(rng, nameUsed);
+  const makeVmHelperAliasName = makeName;
   const bitNames = sharedRuntime ? sharedRuntime.bitNames : {
     mod: makeName(),
     bit: makeName(),
@@ -1401,7 +1355,27 @@ function buildVmSource(
     expandArgs: makeName(),
     callExpanded: makeName(),
     syncLocal: makeName(),
+    cell: makeName(),
+    localValue: makeName(),
+    localSet: makeName(),
+    localDeclare: makeName(),
+    closureFactory: makeName(),
+    varargs: makeName(),
   };
+  const renderInitValue = (entry) => {
+    if (!entry) {
+      return "nil";
+    }
+    if (typeof entry === "object" && entry.cell) {
+      return String(entry.cell);
+    }
+    if (typeof entry === "object" && entry.expr) {
+      return `${helperNames.cell}(${entry.expr})`;
+    }
+    return `${helperNames.cell}(${entry})`;
+  };
+  const localsInit = (initValues || []).map(renderInitValue);
+  const localsTable = `{ ${localsInit.join(", ")} }`;
   const vmStateNames = {
     bcKeyCount: makeName(),
     stateKey: makeName(),
@@ -1507,41 +1481,48 @@ function buildVmSource(
         return finish([]);
       case "PUSH_CONST":
         return finish([pushLine, `stack[top] = ${getConstExpr(aExpr)}`]);
+      case "PUSH_VARARG":
+        return finish([pushLine, `stack[top] = ${helperNames.varargs}[${aExpr}]`]);
+      case "PUSH_VARARGS":
+        return finish([pushLine, `stack[top] = ${helperNames.varargs}`]);
       case "PUSH_LOCAL":
-        return finish([pushLine, `stack[top] = locals[${aExpr}]`]);
+        return finish([pushLine, `stack[top] = ${helperNames.localValue}(${aExpr})`]);
       case "PUSH_LOCAL_ADD_LOCAL":
-        return finish([pushLine, `stack[top] = locals[${aExpr}] + locals[${bExpr}]`]);
+        return finish([pushLine, `stack[top] = ${helperNames.localValue}(${aExpr}) + ${helperNames.localValue}(${bExpr})`]);
       case "PUSH_LOCAL_SUB_LOCAL":
-        return finish([pushLine, `stack[top] = locals[${aExpr}] - locals[${bExpr}]`]);
+        return finish([pushLine, `stack[top] = ${helperNames.localValue}(${aExpr}) - ${helperNames.localValue}(${bExpr})`]);
       case "PUSH_CONST_ADD_CONST":
         return finish([pushLine, `stack[top] = ${getConstExpr(aExpr)} + ${getConstExpr(bExpr)}`]);
       case "ADD_REG_LOCAL":
         return finish([
-          `locals[${aExpr}] = locals[${aExpr}] + locals[${bExpr}]`,
-          `${helperNames.syncLocal}(${aExpr}, locals[${aExpr}])`,
+          `${helperNames.localSet}(${aExpr}, ${helperNames.localValue}(${aExpr}) + ${helperNames.localValue}(${bExpr}))`,
         ]);
       case "ADD_REG_CONST":
         return finish([
-          `locals[${aExpr}] = locals[${aExpr}] + ${getConstExpr(bExpr)}`,
-          `${helperNames.syncLocal}(${aExpr}, locals[${aExpr}])`,
+          `${helperNames.localSet}(${aExpr}, ${helperNames.localValue}(${aExpr}) + ${getConstExpr(bExpr)})`,
         ]);
       case "SUB_REG_LOCAL":
         return finish([
-          `locals[${aExpr}] = locals[${aExpr}] - locals[${bExpr}]`,
-          `${helperNames.syncLocal}(${aExpr}, locals[${aExpr}])`,
+          `${helperNames.localSet}(${aExpr}, ${helperNames.localValue}(${aExpr}) - ${helperNames.localValue}(${bExpr}))`,
         ]);
       case "SUB_REG_CONST":
         return finish([
-          `locals[${aExpr}] = locals[${aExpr}] - ${getConstExpr(bExpr)}`,
-          `${helperNames.syncLocal}(${aExpr}, locals[${aExpr}])`,
+          `${helperNames.localSet}(${aExpr}, ${helperNames.localValue}(${aExpr}) - ${getConstExpr(bExpr)})`,
         ]);
       case "SET_LOCAL":
         return finish([
-          `locals[${aExpr}] = stack[top]`,
-          `${helperNames.syncLocal}(${aExpr}, locals[${aExpr}])`,
+          `${helperNames.localSet}(${aExpr}, stack[top])`,
           "stack[top] = nil",
           "top = top - 1",
         ]);
+      case "DECLARE_LOCAL":
+        return finish([
+          `${helperNames.localDeclare}(${aExpr}, stack[top])`,
+          "stack[top] = nil",
+          "top = top - 1",
+        ]);
+      case "PUSH_CLOSURE":
+        return finish([pushLine, `stack[top] = ${helperNames.closureFactory}[${aExpr}](locals)`]);
       case "PUSH_GLOBAL":
         return finish([pushLine, `stack[top] = env[${getConstExpr(aExpr)}]`]);
       case "SET_GLOBAL":
@@ -1751,6 +1732,20 @@ end)()`);
           "  tbl.n = startIndex + (res.n or #res) - 1",
           "end",
         ]);
+      case "APPEND_VARARGS":
+        return finish([
+          `local startIndex = ${aExpr}`,
+          "local tail = stack[top]",
+          "local tbl = stack[top - 1]",
+          "for i = 1, tail.n or #tail do",
+          "  tbl[startIndex + i - 1] = tail[i]",
+          "end",
+          "if tbl.n ~= nil then",
+          "  tbl.n = startIndex + (tail.n or #tail) - 1",
+          "end",
+          "stack[top] = nil",
+          "top = top - 1",
+        ]);
       case "RETURN":
         if (mode === "block") {
           return [
@@ -1776,13 +1771,75 @@ end)()`);
     return pack(unpack(stack, base, top))
   end
 end)()`);
+      case "RETURN_VARARGS":
+        if (mode === "block") {
+          return [
+            `local prefix = ${aExpr}`,
+            "local tail = stack[top]",
+            "if prefix == 0 then",
+            "  return unpack(tail, 1, tail.n or #tail)",
+            "end",
+            "local merged = { n = prefix + (tail.n or #tail) }",
+            "local prefixBase = top - prefix",
+            "for i = 1, prefix do",
+            "  merged[i] = stack[prefixBase + i - 1]",
+            "end",
+            "for i = 1, tail.n or #tail do",
+            "  merged[prefix + i] = tail[i]",
+            "end",
+            "return unpack(merged, 1, merged.n)",
+          ];
+        }
+        return finishStop(`(function()
+  local prefix = ${aExpr}
+  local tail = stack[top]
+  if prefix == 0 then
+    return tail
+  end
+  local merged = { n = prefix + (tail.n or #tail) }
+  local prefixBase = top - prefix
+  for i = 1, prefix do
+    merged[i] = stack[prefixBase + i - 1]
+  end
+  for i = 1, tail.n or #tail do
+    merged[prefix + i] = tail[i]
+  end
+  return merged
+end)()`);
       case "JMP":
         return finish([], jumpTargetExpr);
+      case "PREP_ITER":
+        return finish([
+          `local fnSlot = ${runtimeTools.floor}(${aExpr} / 65536)`,
+          `local stateSlot = ${aExpr} % 65536`,
+          `local ctrlSlot = ${bExpr}`,
+          `local gen = ${helperNames.localValue}(fnSlot)`,
+          `local state = ${helperNames.localValue}(stateSlot)`,
+          `local ctrl = ${helperNames.localValue}(ctrlSlot)`,
+          `local kind = ${runtimeTools.type}(gen)`,
+          `if kind == "table" or kind == "userdata" then`,
+          `  local mtfn = env["getmetatable"] or getmetatable`,
+          "  local mt = mtfn and mtfn(gen)",
+          `  local mtKind = ${runtimeTools.type}(mt)`,
+          "  local iter = mtKind == \"table\" and mt.__iter or nil",
+          "  local callMeta = mtKind == \"table\" and mt.__call or nil",
+          `  if ${runtimeTools.type}(iter) == "function" then`,
+          "    gen, state, ctrl = iter(gen)",
+          "  elseif kind == \"table\" and callMeta == nil then",
+          "    state = gen",
+          "    gen = env[\"next\"] or next",
+          "    ctrl = nil",
+          "  end",
+          "end",
+          `${helperNames.localSet}(fnSlot, gen)`,
+          `${helperNames.localSet}(stateSlot, state)`,
+          `${helperNames.localSet}(ctrlSlot, ctrl)`,
+        ]);
       case "JMP_IF_LOCAL_LT":
         return [
           `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
           `local right = ${aExpr} % 65536`,
-          `if locals[left] < locals[right] then`,
+          `if ${helperNames.localValue}(left) < ${helperNames.localValue}(right) then`,
           mode === "block" ? `  pc = ${bExpr}` : `  return ${bExpr}, false, nil`,
           "end",
           mode === "block" ? `pc = ${nextExpr}` : `return ${nextExpr}, false, nil`,
@@ -1791,7 +1848,7 @@ end)()`);
         return [
           `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
           `local right = ${aExpr} % 65536`,
-          `if locals[left] > locals[right] then`,
+          `if ${helperNames.localValue}(left) > ${helperNames.localValue}(right) then`,
           mode === "block" ? `  pc = ${bExpr}` : `  return ${bExpr}, false, nil`,
           "end",
           mode === "block" ? `pc = ${nextExpr}` : `return ${nextExpr}, false, nil`,
@@ -1800,7 +1857,7 @@ end)()`);
         return [
           `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
           `local right = ${aExpr} % 65536`,
-          `if locals[left] <= locals[right] then`,
+          `if ${helperNames.localValue}(left) <= ${helperNames.localValue}(right) then`,
           mode === "block" ? `  pc = ${bExpr}` : `  return ${bExpr}, false, nil`,
           "end",
           mode === "block" ? `pc = ${nextExpr}` : `return ${nextExpr}, false, nil`,
@@ -1809,7 +1866,7 @@ end)()`);
         return [
           `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
           `local right = ${aExpr} % 65536`,
-          `if locals[left] >= locals[right] then`,
+          `if ${helperNames.localValue}(left) >= ${helperNames.localValue}(right) then`,
           mode === "block" ? `  pc = ${bExpr}` : `  return ${bExpr}, false, nil`,
           "end",
           mode === "block" ? `pc = ${nextExpr}` : `return ${nextExpr}, false, nil`,
@@ -2202,6 +2259,9 @@ end)()`);
       lines.push(`  op_map[i] = ${bxor32("op_data[i]", "mix")}`);
       lines.push(`end`);
     }
+  } else if (!blockDispatch) {
+    const identityOps = opcodeList.map((_, idx) => idx + 1);
+    lines.push(`local op_map = { ${identityOps.join(", ")} }`);
   }
 
   if (!blockDispatch && keyEncoded && keyMaskPieces) {
@@ -2456,6 +2516,7 @@ end)()`);
   }
 
   lines.push(
+    `local function ${helperNames.cell}(value) return { value } end`,
     `local locals = ${localsTable}`,
     `local stack = {}`,
     `local top = 0`,
@@ -2478,6 +2539,34 @@ end)()`);
     `  unpack = unpack_fn`,
     `end`,
   );
+  if (vmOptions.sandbox !== false) {
+    lines.push(
+      `do`,
+      `  local raw_env = env`,
+      `  local safe_env = {}`,
+      `  local blocked = { debug = true, getfenv = true, setfenv = true, load = true, loadstring = true, dofile = true, loadfile = true, package = true, io = true }`,
+      `  local env_meta = {}`,
+      `  env_meta.__index = function(_, key)`,
+      `    if blocked[key] == true then return nil end`,
+      `    return raw_env[key]`,
+      `  end`,
+      `  env_meta.__newindex = function(_, key, value)`,
+      `    if blocked[key] == true then error("operation unavailable", 0) end`,
+      `    rawset(safe_env, key, value)`,
+      `  end`,
+      `  env_meta.__metatable = "locked"`,
+      `  safe_env._G = safe_env`,
+      `  safe_env._ENV = safe_env`,
+      `  setmetatable(safe_env, env_meta)`,
+      `  env = safe_env`,
+      `end`,
+    );
+  }
+  if (program && program.hasVararg) {
+    lines.push(`local ${helperNames.varargs} = pack(...)`);
+  } else {
+    lines.push(`local ${helperNames.varargs} = { n = 0 }`);
+  }
   lines.push(`local function ${helperNames.expandArgs}(prefix, tail)`);
   lines.push(`  local args = {}`);
   lines.push(`  local count = 0`);
@@ -2500,14 +2589,14 @@ end)()`);
   lines.push(`end`);
   const syncSetterTable = makeName();
   lines.push(`local ${syncSetterTable} = {}`);
-  if (initValues && initValues.length) {
-    initValues.forEach((name, index) => {
-      if (!name) {
+  if (setTargets && setTargets.length) {
+    setTargets.forEach((target, index) => {
+      if (!target || typeof target === "object") {
         return;
       }
       const setterName = makeVmHelperAliasName();
       lines.push(`local function ${setterName}(nextValue)`);
-      lines.push(`  ${name} = nextValue`);
+      lines.push(`  ${target} = nextValue`);
       lines.push(`end`);
       lines.push(`${syncSetterTable}[${index + 1}] = ${setterName}`);
     });
@@ -2519,6 +2608,100 @@ end)()`);
   lines.push(`  end`);
   lines.push(`  return`);
   lines.push(`end`);
+  lines.push(`local function ${helperNames.localValue}(idx)`);
+  lines.push(`  local slot = locals[idx]`);
+  lines.push(`  if slot == nil then return nil end`);
+  lines.push(`  return slot[1]`);
+  lines.push(`end`);
+  lines.push(`local function ${helperNames.localSet}(idx, value)`);
+  lines.push(`  local slot = locals[idx]`);
+  lines.push(`  if slot == nil then`);
+  lines.push(`    slot = ${helperNames.cell}(nil)`);
+  lines.push(`    locals[idx] = slot`);
+  lines.push(`  end`);
+  lines.push(`  slot[1] = value`);
+  lines.push(`  ${helperNames.syncLocal}(idx, value)`);
+  lines.push(`end`);
+  lines.push(`local function ${helperNames.localDeclare}(idx, value)`);
+  lines.push(`  locals[idx] = ${helperNames.cell}(value)`);
+  lines.push(`  ${helperNames.syncLocal}(idx, value)`);
+  lines.push(`end`);
+  lines.push(`local ${helperNames.closureFactory} = {}`);
+  if (program && Array.isArray(program.closures) && program.closures.length) {
+    program.closures.forEach((closure, index) => {
+      const nestedProgram = closure && closure.program ? closure.program : null;
+      if (!nestedProgram) {
+        return;
+      }
+      const nestedOpcodeList = Array.from(new Set([
+        ...OPCODES,
+        ...NOISE_OPCODES,
+        ...(nestedProgram.instructions || [])
+          .map((inst) => inst && inst[0])
+          .filter((name) => typeof name === "string"),
+      ]));
+      const nestedOpcodeMap = buildOpcodeMap(null, false, nestedOpcodeList);
+      nestedProgram.instructions = compactInstructionList(nestedProgram.instructions || []).map((inst) => {
+        if (!inst || typeof inst[0] !== "string") {
+          return inst;
+        }
+        const opName = inst[0];
+        const width = getOpcodeArity(opName);
+        const out = [nestedOpcodeMap[opName]];
+        if (width >= 1) {
+          out.push(inst[1] || 0);
+        }
+        if (width >= 2) {
+          out.push(inst[2] || 0);
+        }
+        return out;
+      });
+      const nestedOptions = {
+        ...vmOptions,
+        blockDispatch: false,
+        bytecodeEncrypt: false,
+        constsEncrypt: false,
+        constsSplit: false,
+        runtimeKey: false,
+        runtimeSplit: false,
+        decoyRuntime: false,
+        symbolNoise: false,
+        dynamicCoupling: false,
+      };
+      const nestedBuilt = buildVmSource(
+        nestedProgram,
+        null,
+        nestedProgram.paramNames || [],
+        null,
+        null,
+        null,
+        null,
+        rng,
+        nestedOptions,
+        reservedNames,
+        nestedOpcodeList,
+        null,
+        sharedRuntime
+      );
+      const nestedSource = typeof nestedBuilt === "string" ? nestedBuilt : nestedBuilt.source;
+      const params = (nestedProgram.paramNames || [])
+        .map((name, paramIndex) => (name && typeof name === "string" ? name : `_${paramIndex + 1}`));
+      if (nestedProgram.hasVararg) {
+        params.push("...");
+      }
+      lines.push(`${helperNames.closureFactory}[${index + 1}] = function(__vm_parent_locals)`);
+      const captureCells = Array.isArray(closure.captures) && closure.captures.length
+        ? closure.captures.map((capture) => `__vm_parent_locals[${capture.index}]`).join(", ")
+        : "";
+      lines.push(`  local __vm_captures = { ${captureCells} }`);
+      lines.push(`  return function(${params.join(", ")})`);
+      nestedSource.split("\n").forEach((line) => {
+        lines.push(`    ${line}`);
+      });
+      lines.push(`  end`);
+      lines.push(`end`);
+    });
+  }
   const dynamicCoupling = vmOptions.dynamicCoupling !== false;
   const couplingMul = rng.int(3, 31);
   const couplingAdd = rng.int(7, 127);
@@ -2662,6 +2845,16 @@ end)()`);
       const leftLocal = Math.floor(a / 65536);
       const rightLocal = a % 65536;
       const targetIdB = idByIndex.get(b) || 0;
+      const baseOpName = typeof opName === "string" && opName.endsWith("_X")
+        ? opName.slice(0, -2)
+        : opName;
+      const emitSharedBlockBody = () => emitSharedOpBody(baseOpName, {
+        mode: "block",
+        nextExpr: String(nextId),
+        aExpr,
+        bExpr,
+        jumpTargetExpr: String(targetId),
+      });
       switch (opName) {
         case "CALL_EXPAND":
           return [
@@ -2785,7 +2978,7 @@ end)()`);
           return [`pc = ${targetId}`];
         case "JMP_IF_LOCAL_LT":
           return [
-            `if locals[${leftLocal}] < locals[${rightLocal}] then`,
+            `if ${helperNames.localValue}(${leftLocal}) < ${helperNames.localValue}(${rightLocal}) then`,
             `  pc = ${targetIdB}`,
             "else",
             `  pc = ${nextId}`,
@@ -2793,7 +2986,7 @@ end)()`);
           ];
         case "JMP_IF_LOCAL_GT":
           return [
-            `if locals[${leftLocal}] > locals[${rightLocal}] then`,
+            `if ${helperNames.localValue}(${leftLocal}) > ${helperNames.localValue}(${rightLocal}) then`,
             `  pc = ${targetIdB}`,
             "else",
             `  pc = ${nextId}`,
@@ -2801,7 +2994,7 @@ end)()`);
           ];
         case "JMP_IF_LOCAL_LE":
           return [
-            `if locals[${leftLocal}] <= locals[${rightLocal}] then`,
+            `if ${helperNames.localValue}(${leftLocal}) <= ${helperNames.localValue}(${rightLocal}) then`,
             `  pc = ${targetIdB}`,
             "else",
             `  pc = ${nextId}`,
@@ -2809,7 +3002,7 @@ end)()`);
           ];
         case "JMP_IF_LOCAL_GE":
           return [
-            `if locals[${leftLocal}] >= locals[${rightLocal}] then`,
+            `if ${helperNames.localValue}(${leftLocal}) >= ${helperNames.localValue}(${rightLocal}) then`,
             `  pc = ${targetIdB}`,
             "else",
             `  pc = ${nextId}`,
@@ -2841,26 +3034,22 @@ end)()`);
           ];
         case "ADD_REG_LOCAL":
           return [
-            `locals[${a}] = locals[${a}] + locals[${b}]`,
-            `${helperNames.syncLocal}(${a}, locals[${a}])`,
+            `${helperNames.localSet}(${a}, ${helperNames.localValue}(${a}) + ${helperNames.localValue}(${b}))`,
             `pc = ${nextId}`,
           ];
         case "ADD_REG_CONST":
           return [
-            `locals[${a}] = locals[${a}] + ${helperNames.getConst}(${b})`,
-            `${helperNames.syncLocal}(${a}, locals[${a}])`,
+            `${helperNames.localSet}(${a}, ${helperNames.localValue}(${a}) + ${helperNames.getConst}(${b}))`,
             `pc = ${nextId}`,
           ];
         case "SUB_REG_LOCAL":
           return [
-            `locals[${a}] = locals[${a}] - locals[${b}]`,
-            `${helperNames.syncLocal}(${a}, locals[${a}])`,
+            `${helperNames.localSet}(${a}, ${helperNames.localValue}(${a}) - ${helperNames.localValue}(${b}))`,
             `pc = ${nextId}`,
           ];
         case "SUB_REG_CONST":
           return [
-            `locals[${a}] = locals[${a}] - ${helperNames.getConst}(${b})`,
-            `${helperNames.syncLocal}(${a}, locals[${a}])`,
+            `${helperNames.localSet}(${a}, ${helperNames.localValue}(${a}) - ${helperNames.getConst}(${b}))`,
             `pc = ${nextId}`,
           ];
         case "SUB":
@@ -2996,7 +3185,7 @@ end)()`);
         case "NOISE_READ":
           return [
             "local probe = stack[top]",
-            "if probe == nil then probe = locals[1] end",
+            `if probe == nil then probe = ${helperNames.localValue}(1) end`,
             `pc = ${nextId}`,
           ];
         case "NOISE_WRITE":
@@ -3014,7 +3203,7 @@ end)()`);
             "end",
           ];
         default:
-          return [`pc = ${nextId}`];
+          return emitSharedBlockBody() || [`pc = ${nextId}`];
       }
     };
 

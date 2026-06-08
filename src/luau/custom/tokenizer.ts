@@ -386,6 +386,95 @@ export class Tokenizer implements TokenizerInstance {
     const column = this.column;
     const start = this.index;
     let i = this.index + 1;
+    let depth = 0;
+    let long: { close: string } | null = null;
+    while (i < this.length) {
+      if (long) {
+        if (this.source.startsWith(long.close, i)) {
+          i += long.close.length;
+          long = null;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+      const ch = this.source[i];
+      if (ch === "\\") {
+        const next = this.source[i + 1];
+        if (next === "z") {
+          i += 2;
+          while (i < this.length) {
+            const ws = this.source[i];
+            if (ws === " " || ws === "\t" || ws === "\v" || ws === "\f" || ws === "\r" || ws === "\n") {
+              i += 1;
+              continue;
+            }
+            break;
+          }
+          continue;
+        }
+        if (next === "\r") {
+          i += this.source[i + 2] === "\n" ? 3 : 2;
+          continue;
+        }
+        if (next === "\n") {
+          i += 2;
+          continue;
+        }
+        i += 2;
+        continue;
+      }
+      if (depth === 0 && ch === "`") {
+        i += 1;
+        break;
+      }
+      if (depth === 0 && (ch === "\n" || ch === "\r")) {
+        break;
+      }
+      if (depth > 0 && (ch === "\"" || ch === "'" || ch === "`")) {
+        i = this.skipQuotedStringAt(i, ch);
+        continue;
+      }
+      if (depth > 0 && ch === "-" && this.source[i + 1] === "-") {
+        const commentLong = this.readLongBracketInfo(i + 2);
+        if (commentLong) {
+          long = { close: commentLong.close };
+          i += 2 + commentLong.openLength;
+          continue;
+        }
+        i += 2;
+        while (i < this.length && this.source[i] !== "\n" && this.source[i] !== "\r") {
+          i += 1;
+        }
+        continue;
+      }
+      if (depth > 0 && ch === "[") {
+        const longString = this.readLongBracketInfo(i);
+        if (longString) {
+          long = { close: longString.close };
+          i += longString.openLength;
+          continue;
+        }
+      }
+      if (ch === "{") {
+        depth += 1;
+        i += 1;
+        continue;
+      }
+      if (ch === "}" && depth > 0) {
+        depth -= 1;
+        i += 1;
+        continue;
+      }
+      i += 1;
+    }
+    const raw = this.source.slice(this.index, i);
+    this.advanceTo(i);
+    return this.makeToken("interpString", raw, start, line, column);
+  }
+
+  skipQuotedStringAt(index: number, quote: string): number {
+    let i = index + 1;
     while (i < this.length) {
       const ch = this.source[i];
       if (ch === "\\") {
@@ -413,18 +502,31 @@ export class Tokenizer implements TokenizerInstance {
         i += 2;
         continue;
       }
-      if (ch === "`") {
-        i += 1;
-        break;
-      }
-      if (ch === "\n" || ch === "\r") {
-        break;
+      if (ch === quote) {
+        return i + 1;
       }
       i += 1;
     }
-    const raw = this.source.slice(this.index, i);
-    this.advanceTo(i);
-    return this.makeToken("interpString", raw, start, line, column);
+    return this.length;
+  }
+
+  readLongBracketInfo(index: number): { openLength: number; close: string } | null {
+    if (this.source[index] !== "[") {
+      return null;
+    }
+    let i = index + 1;
+    let equalsCount = 0;
+    while (this.source[i] === "=") {
+      equalsCount += 1;
+      i += 1;
+    }
+    if (this.source[i] !== "[") {
+      return null;
+    }
+    return {
+      openLength: i - index + 1,
+      close: `]${"=".repeat(equalsCount)}]`,
+    };
   }
 
   readLongString(): Token | null {

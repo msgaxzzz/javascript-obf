@@ -91,6 +91,7 @@ It also installs the latest official Luau CLI for Linux from `luau-lang/luau` an
 ## CLI options
 - `-o, --output <file>` Output file
 - `--preset <high|balanced|low>` Preset strength (default `high`)
+- `--scheme <classic|stealth|runtime>` JavaScript scheme (default `classic`): `classic` preserves current defaults, `stealth` reduces fixed output traits and varies string/runtime layout, `runtime` enables JS VM defaults unless VM is explicitly configured
 - `--no-rename` Disable variable renaming
 - `--rename-globals` Rename global bindings (Luau)
 - `--rename-members` Rename member/table keys (Luau)
@@ -134,8 +135,9 @@ It also installs the latest official Luau CLI for Linux from `luau-lang/luau` an
 - `--pad-footer-blocks <n>` Number of fake blocks (Luau, default 2)
 - `--no-cff` Disable control-flow flattening
 - `--cff-downlevel` Allow CFF to downlevel `let/const` to `var`
-- `--cff-mode <vm|classic>` Luau CFF mode (default `classic`)
+- `--cff-mode <vm|classic|woven>` Luau CFF mode (default `classic`; `woven` uses nested/range-dispatch flow for broader statement coverage and short generated CFF names)
 - `--cff-opaque` Enable opaque predicates (default on)
+- `--cff-hide-top-return-expr` Hide simple top-level return call targets with local table indirection (Luau woven CFF, opt-in)
 - `--no-dead` Disable dead-code injection
 - `--vm` Enable VM virtualization (see limitations)
 - `--vm-layers <n>` VM layers (Luau)

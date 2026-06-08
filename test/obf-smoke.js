@@ -1,6 +1,7 @@
 const assert = require("assert");
 const vm = require("vm");
 const api = require("../src");
+const { normalizeOptions } = require("../src/options");
 const { obfuscate } = api;
 
 assert.ok(typeof api.obfuscate === "function", "top-level obfuscate API should still be exported");
@@ -104,7 +105,58 @@ function main(input) {
 main([1, 2, 3, 4]);
 `;
 
+const runtimeSource = `
+function runtimeTarget(x) {
+  var y = x + 1;
+  for (var i = 0; i < 3; i++) {
+    y += i;
+  }
+  if (y > 5) {
+    y *= 2;
+  }
+  return y;
+}
+
+globalThis.__result = { value: runtimeTarget(4) };
+`;
+
 async function main() {
+  const classicOptions = normalizeOptions({ lang: "js" });
+  assert.strictEqual(classicOptions.scheme, "classic");
+  assert.strictEqual(classicOptions.vm.enabled, false);
+
+  const stealthOptions = normalizeOptions({ lang: "js", scheme: "stealth" });
+  assert.strictEqual(stealthOptions.scheme, "stealth");
+  assert.strictEqual(stealthOptions.stringsOptions.minLength, 2);
+  assert.strictEqual(stealthOptions.stringsOptions.segmentSize, 96);
+  assert.strictEqual(stealthOptions.deadCodeOptions.probability, 0.1);
+
+  const runtimeOptions = normalizeOptions({ lang: "js", scheme: "runtime" });
+  assert.strictEqual(runtimeOptions.scheme, "runtime");
+  assert.strictEqual(runtimeOptions.vm.enabled, true);
+  assert.strictEqual(runtimeOptions.vm.all, true);
+  assert.strictEqual(runtimeOptions.vm.downlevel, true);
+  assert.strictEqual(runtimeOptions.vm.fakeOpcodes, 0.2);
+
+  const runtimeDisabled = normalizeOptions({
+    lang: "js",
+    scheme: "runtime",
+    vm: false,
+  });
+  assert.strictEqual(runtimeDisabled.vm.enabled, false);
+
+  const luauSchemeIgnored = normalizeOptions({
+    lang: "luau",
+    scheme: "runtime",
+  });
+  assert.strictEqual(luauSchemeIgnored.scheme, "classic");
+
+  const luauWovenCff = normalizeOptions({
+    lang: "luau",
+    cffOptions: { mode: "woven" },
+  });
+  assert.strictEqual(luauWovenCff.cffOptions.mode, "woven");
+
   const baseline = runCode(source);
 
   const obfHigh = await obfuscate(source, { preset: "high", seed: "test-seed" });
@@ -112,6 +164,10 @@ async function main() {
 
   assert.deepStrictEqual(obfHighResult.result, baseline.result);
   assert.deepStrictEqual(obfHighResult.logs, baseline.logs);
+  assert(!obfHigh.code.includes("__obf_val"), "string runtime should not expose fixed value local");
+  assert(!obfHigh.code.includes("__obf_bytes"), "string runtime should not expose fixed byte local");
+  assert(!obfHigh.code.includes("Decoder unavailable"), "string runtime should not expose fixed decoder error");
+  assert(!obfHigh.code.includes("本文件受到保护"), "string pool should not expose fixed bait text");
 
   const obfVm = await obfuscate(source, {
     preset: "low",
@@ -122,6 +178,22 @@ async function main() {
 
   assert.deepStrictEqual(obfVmResult.result, baseline.result);
   assert.deepStrictEqual(obfVmResult.logs, baseline.logs);
+  assert(!obfVm.code.includes("__vm_rt_"), "VM runtime cache key should not expose fixed prefix");
+  assert(!obfVm.code.includes("__vm_this_"), "VM env this key should not expose fixed prefix");
+  assert(!obfVm.code.includes("__vm_args_"), "VM env args key should not expose fixed prefix");
+  assert(!obfVm.code.includes("__vm_new_target_"), "VM env new.target key should not expose fixed prefix");
+  assert(!obfVm.code.includes("_vm$tmp"), "VM compiler temps should not expose fixed prefix");
+
+  const runtimeBaseline = runCode(runtimeSource);
+  const obfRuntime = await obfuscate(runtimeSource, {
+    preset: "low",
+    scheme: "runtime",
+    seed: "test-seed",
+  });
+  const obfRuntimeResult = runCode(obfRuntime.code, 20000);
+
+  assert.deepStrictEqual(obfRuntimeResult.result, runtimeBaseline.result);
+  assert(!obfRuntime.code.includes("__vm_rt_"), "runtime scheme should hide VM cache prefix");
 
   console.log("obfuscation smoke test passed");
 }

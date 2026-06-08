@@ -6,6 +6,7 @@ export interface RenameOptions {
     renameGlobals?: boolean;
     renameMembers?: boolean;
     homoglyphs?: boolean;
+    preserveTopReturnNames?: boolean;
   };
 }
 

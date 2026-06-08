@@ -1,4 +1,5 @@
 const { walk } = require("../ast");
+const { makeShortNameFactory } = require("../names");
 
 function luaString(value) {
   const text = String(value);
@@ -68,26 +69,105 @@ const VM_NAME_RESERVED = new Set([
   "utf8",
 ]);
 
+const VM_TEMPLATE_RESERVED = new Set([
+  "_",
+  "a",
+  "b",
+  "c",
+  "d",
+  "e",
+  "f",
+  "g",
+  "h",
+  "i",
+  "j",
+  "k",
+  "l",
+  "m",
+  "n",
+  "o",
+  "p",
+  "q",
+  "r",
+  "s",
+  "t",
+  "u",
+  "v",
+  "w",
+  "x",
+  "y",
+  "z",
+  "abit",
+  "argc",
+  "args",
+  "arr",
+  "base",
+  "bit",
+  "bits",
+  "bitv",
+  "block",
+  "carry",
+  "count",
+  "cursor",
+  "data",
+  "fn",
+  "getf",
+  "ghost",
+  "hi",
+  "hid",
+  "idx",
+  "inst",
+  "key",
+  "left",
+  "len",
+  "limit",
+  "lo",
+  "merged",
+  "mix",
+  "nextValue",
+  "offset",
+  "op",
+  "part",
+  "pcv",
+  "pos",
+  "prefix",
+  "prefixArgs",
+  "prefixBase",
+  "prefixCount",
+  "probe",
+  "pulse",
+  "raw",
+  "res",
+  "retc",
+  "right",
+  "salt",
+  "setter",
+  "size",
+  "slot",
+  "startIndex",
+  "sum",
+  "tag",
+  "tagEnc",
+  "tail",
+  "tailCount",
+  "tbl",
+  "token",
+  "value",
+  "width",
+]);
+
+function addVmReservedNames(usedNames) {
+  VM_TEMPLATE_RESERVED.forEach((name) => usedNames.add(name));
+  return usedNames;
+}
+
+function makeVmNameFactory(rng, usedNames) {
+  addVmReservedNames(usedNames);
+  return makeShortNameFactory(rng, usedNames, VM_NAME_RESERVED);
+}
+
 function makeVmHelperName(rng, usedNames) {
-  const firstAlphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  const restAlphabet = `${firstAlphabet}0123456789`;
-  let out = "";
-  while (
-    !out ||
-    VM_NAME_KEYWORDS.has(out) ||
-    VM_NAME_RESERVED.has(out) ||
-    usedNames.has(out) ||
-    out.toLowerCase().includes("obf")
-  ) {
-    const length = rng.int(4, 8);
-    let randomName = firstAlphabet[rng.int(0, firstAlphabet.length - 1)];
-    for (let i = 1; i < length; i += 1) {
-      randomName += restAlphabet[rng.int(0, restAlphabet.length - 1)];
-    }
-    out = randomName;
-  }
-  usedNames.add(out);
-  return out;
+  return makeVmNameFactory(rng, usedNames)();
 }
 
 function makeVmCharExpr(charName, text) {
@@ -107,7 +187,7 @@ function createSharedVmRuntime(rng, reservedNames = null) {
       }
     });
   }
-  const makeName = () => makeVmHelperName(rng, usedNames);
+  const makeName = makeVmNameFactory(rng, usedNames);
   return {
     runtimeTools: {
       bundle: makeName(),
@@ -154,7 +234,7 @@ function buildSharedVmRuntimePreludeSource(sharedRuntime, rng) {
     ...Object.values(runtimeTools),
     ...Object.values(bitNames),
   ]);
-  const localName = () => makeVmHelperName(rng, usedNames);
+  const localName = makeVmNameFactory(rng, usedNames);
   const bitKeyName = localName();
   const bitDataName = localName();
   const bitOutName = localName();
@@ -330,6 +410,7 @@ module.exports = {
   luaByteString,
   VM_NAME_KEYWORDS,
   VM_NAME_RESERVED,
+  makeVmNameFactory,
   makeVmHelperName,
   makeVmCharExpr,
   createSharedVmRuntime,

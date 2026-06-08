@@ -32,6 +32,15 @@ function shouldThrow(name, fn) {
 }
 
 {
+  const source = "const answer = 42\nreturn answer";
+  const ast = custom.parseLuau(source);
+  const printed = custom.generateLuau(ast);
+
+  assert.ok(printed.includes("const answer = 42"), "public printer API should preserve const declarations");
+  assert.ok(printed.includes("return answer"), "public printer API should round-trip const reads");
+}
+
+{
   const source = "local x = if ok then 1 else 2";
   const ast = custom.parseLuau(source);
   const printed = custom.generateLuau(ast);
@@ -46,6 +55,17 @@ function shouldThrow(name, fn) {
 
   assert.ok(printed.includes("local function f"), "public printer API should print canonical local functions");
 }
+
+roundTrip(
+  "const-declaration",
+  [
+    "const answer: number = 42",
+    "const a, b, c = 42, f()",
+    "const function getAnswer() return answer end",
+    "local const = 1",
+    "return answer + const",
+  ].join("\n"),
+);
 
 roundTrip(
   "numeric-literals",
@@ -93,6 +113,11 @@ roundTrip(
 );
 
 roundTrip(
+  "nested-interpolated-string",
+  "local s = `outer {`inner {name}`}`",
+);
+
+roundTrip(
   "interpolated-escapes",
   [
     "local s = `hello \\{name\\}`",
@@ -117,6 +142,16 @@ roundTrip(
     "declare foo: number",
     "declare function bar(x: number, y: number): number",
     "declare function baz<T>(x: T): T",
+    "declare function pack<T...>(...: T...): T...",
+    "declare class Foo",
+    "  prop: number",
+    "  function method(self, foo: number): string",
+    "  [string]: number",
+    "end",
+    "declare extern type Bar extends Foo with",
+    "  prop2: string",
+    "end",
+    "declare extern type Empty",
   ].join("\n"),
 );
 
@@ -129,5 +164,39 @@ shouldThrow("break-not-laststat", () => parse("while true do break; local x = 1 
 shouldThrow("continue-not-laststat", () => parse("while true do continue; local x = 1 end"));
 shouldThrow("function-default-type-params", () => parse("function id<T = number>(x: T): T return x end"));
 shouldThrow("type-function-default-type-params", () => parse("type function Foo<T = number>() end"));
+shouldThrow("const-missing-init", () => parse("const c"));
+shouldThrow("const-missing-multi-init", () => parse("const a, b = nil"));
+shouldThrow("const-missing-after-call", () => parse("const a, b, c = f(), 42"));
+shouldThrow("generic-type-after-pack", () => parse("type Y<T..., U> = {}"));
+shouldThrow("generic-default-missing", () => parse("type Y<T = number, U> = {}"));
+shouldThrow("generic-pack-default-missing", () => parse("type Y<T... = ...number, U...> = {}"));
+shouldThrow("generic-pack-default-not-pack", () => parse("type Y<T... = (string) -> number> = {}"));
+shouldThrow("type-pack-in-table-field", () => parse("type Y<T...> = { a: T... }"));
+shouldThrow("interp-missing-expression", () => parse("local s = `bad {}`"));
+shouldThrow("interp-missing-close", () => parse("local s = `bad {name`"));
+shouldThrow("attr-on-if", () => parse("@checked if true then end"));
+shouldThrow("declare-param-missing-type", () => parse("declare function foo(x)"));
+shouldThrow("declare-method-missing-self", () => parse("declare class Foo\n  function method(foo: number)\nend"));
+shouldThrow("declare-method-missing-type", () => parse("declare class Foo\n  function method(self, foo)\nend"));
+
+{
+  assert.deepStrictEqual(
+    custom.validate(custom.parseLuau("const x = 1\nlocal x = 2\nx = 3")),
+    [],
+    "local shadow should allow assignment to the shadowed binding",
+  );
+  assert.ok(
+    custom.validate(custom.parseLuau("const x = 1\nx = 2")).some((msg) => msg.includes("cannot assign to const 'x'")),
+    "assignment to const should be rejected by semantic validation",
+  );
+  assert.ok(
+    custom.validate(custom.parseLuau("const x = 1\nx += 2")).some((msg) => msg.includes("cannot assign to const 'x'")),
+    "compound assignment to const should be rejected by semantic validation",
+  );
+  assert.ok(
+    custom.validate(custom.parseLuau("const x = 1\nlocal f = function() x = 2 end")).some((msg) => msg.includes("cannot assign to const 'x'")),
+    "closure assignment to outer const should be rejected by semantic validation",
+  );
+}
 
 console.log("luau-custom-roundtrip: ok");

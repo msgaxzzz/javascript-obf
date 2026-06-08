@@ -42,6 +42,7 @@ const { padFooterLuau } = require("./padFooter");
 const { stylizeNumericLiteralsLuau } = require("./literalStyle");
 const { buildSourceMap, shiftMappings } = require("./sourceMap");
 const { createLuauDebugRecorder } = require("./debug");
+const { makeShortNameFactory } = require("./names");
 const MAX_LUAU_OUTPUT_BYTES = 5 * 1024 * 1024;
 const PACKED_PAYLOAD_RADIX = 85;
 const PACKED_PAYLOAD_ALPHABET = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ.-:+=^!/*?&<>()[]{}@%$#";
@@ -326,23 +327,9 @@ function neutralizeDoubleDashInCode(source) {
   return chunks.join("");
 }
 
-function makePackedIdentifier(rng) {
-  const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
-  const alnum = `${letters}0123456789`;
-  const length = rng && typeof rng.int === "function" ? rng.int(7, 13) : 9;
-  let out = letters[(rng && typeof rng.int === "function" ? rng.int(0, letters.length - 1) : Math.floor(Math.random() * letters.length))];
-  while (out.length < length) {
-    const source = rng && typeof rng.int === "function"
-      ? rng.int(0, alnum.length - 1)
-      : Math.floor(Math.random() * alnum.length);
-    out += alnum[source];
-  }
-  return out;
-}
-
 function makeLongBracketLiteral(source) {
   const value = String(source);
-  let equalsCount = 0;
+  let equalsCount = 1;
   while (
     value.includes(`]${"=".repeat(equalsCount)}]`)
     || value.endsWith(`]${"=".repeat(equalsCount)}`)
@@ -472,47 +459,48 @@ function buildPackedLuauShell(code, rng) {
     PACKED_PAYLOAD_ALPHABET.slice(alphabetSplitA, alphabetSplitB),
     PACKED_PAYLOAD_ALPHABET.slice(alphabetSplitB),
   ].filter(Boolean);
-  const partsVar = makePackedIdentifier(rng);
-  const loaderVar = makePackedIdentifier(rng);
-  const indexVar = makePackedIdentifier(rng);
-  const blockVar = makePackedIdentifier(rng);
-  const valueVar = makePackedIdentifier(rng);
-  const decodedVar = makePackedIdentifier(rng);
-  const packedVar = makePackedIdentifier(rng);
-  const sizeVar = makePackedIdentifier(rng);
-  const decodeVar = makePackedIdentifier(rng);
-  const envVar = makePackedIdentifier(rng);
-  const stateVar = makePackedIdentifier(rng);
-  const joinVar = makePackedIdentifier(rng);
-  const concatKeyVar = makePackedIdentifier(rng);
-  const alphabetVar = makePackedIdentifier(rng);
-  const loadAKeyVar = makePackedIdentifier(rng);
-  const loadBKeyVar = makePackedIdentifier(rng);
-  const loadAHeadVar = makePackedIdentifier(rng);
-  const loadATailVar = makePackedIdentifier(rng);
-  const loadBHeadVar = makePackedIdentifier(rng);
-  const loadBTailVar = makePackedIdentifier(rng);
-  const execVar = makePackedIdentifier(rng);
-  const dispatchVar = makePackedIdentifier(rng);
-  const payloadArgVar = makePackedIdentifier(rng);
-  const sizeArgVar = makePackedIdentifier(rng);
-  const outVar = makePackedIdentifier(rng);
-  const rootVar = makePackedIdentifier(rng);
-  const limitVar = makePackedIdentifier(rng);
-  const cursorVar = makePackedIdentifier(rng);
-  const fragmentIndexVar = makePackedIdentifier(rng);
-  const fragmentEntryVar = makePackedIdentifier(rng);
+  const nameFor = makeShortNameFactory(rng, new Set(["_"]));
+  const partsVar = nameFor();
+  const loaderVar = nameFor();
+  const indexVar = nameFor();
+  const blockVar = nameFor();
+  const valueVar = nameFor();
+  const decodedVar = nameFor();
+  const packedVar = nameFor();
+  const sizeVar = nameFor();
+  const decodeVar = nameFor();
+  const envVar = nameFor();
+  const stateVar = nameFor();
+  const joinVar = nameFor();
+  const concatKeyVar = nameFor();
+  const alphabetVar = nameFor();
+  const loadAKeyVar = nameFor();
+  const loadBKeyVar = nameFor();
+  const loadAHeadVar = nameFor();
+  const loadATailVar = nameFor();
+  const loadBHeadVar = nameFor();
+  const loadBTailVar = nameFor();
+  const execVar = nameFor();
+  const dispatchVar = nameFor();
+  const payloadArgVar = nameFor();
+  const sizeArgVar = nameFor();
+  const outVar = nameFor();
+  const rootVar = nameFor();
+  const limitVar = nameFor();
+  const cursorVar = nameFor();
+  const fragmentIndexVar = nameFor();
+  const fragmentEntryVar = nameFor();
   const decodeTemplate = rng && typeof rng.int === "function" ? rng.int(0, 2) : 0;
   const shardTemplate = rng && typeof rng.int === "function" ? rng.int(0, 2) : 0;
   const shuffled = fragments.map((value, idx) => ({ value, idx: idx + 1 }));
   if (rng && typeof rng.shuffle === "function") {
     rng.shuffle(shuffled);
   }
-  const shardVars = Array.from({ length: rng && typeof rng.int === "function" ? rng.int(2, 4) : 2 }, () => makePackedIdentifier(rng));
-  const stageVar = makePackedIdentifier(rng);
-  const assembleVar = makePackedIdentifier(rng);
-  const rehydrateVar = makePackedIdentifier(rng);
-  const alphabetPartVars = alphabetParts.map(() => makePackedIdentifier(rng));
+  const shardVars = Array.from({ length: rng && typeof rng.int === "function" ? rng.int(2, 4) : 2 }, () => nameFor());
+  const stageVar = nameFor();
+  const assembleVar = nameFor();
+  const rehydrateVar = nameFor();
+  const alphabetPartVars = alphabetParts.map(() => nameFor());
 
   const lines = [
     "return(function(...)",

@@ -304,7 +304,7 @@ function processStatement(stmt, scope, includeTypes) {
       }
       stmt.variables.forEach((id) => {
         if (id && id.name) {
-          addBinding(scope, id.name, "local", id);
+          addBinding(scope, id.name, stmt.isConst ? "const" : "local", id);
         }
         processTypedIdentifier(id, scope, includeTypes);
       });
@@ -324,7 +324,7 @@ function processStatement(stmt, scope, includeTypes) {
     case "StatFunction":
     case "StatLocalFunction": {
       if ((stmt.isLocal || stmt.type === "StatLocalFunction") && stmt.name && stmt.name.base) {
-        addBinding(scope, stmt.name.base.name, "local", stmt.name.base);
+        addBinding(scope, stmt.name.base.name, stmt.isConst ? "const" : "local", stmt.name.base);
       } else if (stmt.name && stmt.name.base) {
         const hasMembers = (stmt.name.members && stmt.name.members.length) || stmt.name.method;
         addReference(scope, stmt.name.base.name, stmt.name.base, hasMembers ? "read" : "write");
@@ -448,6 +448,37 @@ function processStatement(stmt, scope, includeTypes) {
       if (includeTypes && stmt.name && stmt.name.name) {
         addTypeBinding(scope, stmt.name.name, "declare", stmt.name);
         processType(stmt.annotation, scope, includeTypes);
+      }
+      return;
+    case "DeclareExternTypeStatement":
+      if (includeTypes && stmt.name && stmt.name.name) {
+        addTypeBinding(scope, stmt.name.name, "declare", stmt.name);
+        if (stmt.superName) {
+          addTypeReference(scope, stmt.superName.name, stmt.superName);
+        }
+        if (Array.isArray(stmt.props)) {
+          stmt.props.forEach((prop) => {
+            if (prop.kind === "method") {
+              const memberScope = createScope(scope, prop);
+              bindTypeParameters(memberScope, prop.typeParameters, includeTypes);
+              if (Array.isArray(prop.parameters)) {
+                prop.parameters.forEach((param) => processTypedIdentifier(param, memberScope, includeTypes));
+              }
+              if (prop.hasVararg && prop.varargAnnotation) {
+                processType(prop.varargAnnotation, memberScope, includeTypes);
+              }
+              if (prop.returnType) {
+                processType(prop.returnType, memberScope, includeTypes);
+              }
+            } else if (prop.value) {
+              processType(prop.value, scope, includeTypes);
+            }
+          });
+        }
+        if (stmt.indexer) {
+          processType(stmt.indexer.key, scope, includeTypes);
+          processType(stmt.indexer.value, scope, includeTypes);
+        }
       }
       return;
     case "BreakStatement":

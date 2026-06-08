@@ -1,4 +1,4 @@
-const { collectIdentifierNames, makeNameFactory } = require("./names");
+const { collectIdentifierNames, makeShortNameFactory } = require("./names");
 
 function buildBlock(nameFor, rng) {
   const a = nameFor();
@@ -72,7 +72,7 @@ function padFooterLuau(ast, ctx) {
     return;
   }
   const usedNames = collectIdentifierNames(ast, ctx);
-  const nameFor = makeNameFactory(ctx.rng, usedNames);
+  const nameFor = makeShortNameFactory(ctx.rng, usedNames);
 
   const snippets = [];
   for (let i = 0; i < blocks; i += 1) {

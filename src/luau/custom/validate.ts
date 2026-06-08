@@ -59,6 +59,9 @@ function validateNode(node, errors, path) {
     case "LocalStatement":
       ensureArrayOfNodes(node.variables, errors, `${path}.variables`);
       ensureArray(node.init, errors, `${path}.init`);
+      if (node.isConst !== undefined) {
+        ensureBoolean(node.isConst, errors, `${path}.isConst`);
+      }
       return;
     case "AssignmentStatement":
       ensureArrayOfNodes(node.variables, errors, `${path}.variables`);
@@ -76,6 +79,9 @@ function validateNode(node, errors, path) {
       ensureNode(node.name, errors, `${path}.name`);
       ensureArrayOfNodes(node.parameters, errors, `${path}.parameters`);
       ensureBoolean(node.isLocal, errors, `${path}.isLocal`);
+      if (node.isConst !== undefined) {
+        ensureBoolean(node.isConst, errors, `${path}.isConst`);
+      }
       ensureNode(node.body, errors, `${path}.body`);
       return;
     case "FunctionExpression":
@@ -145,6 +151,27 @@ function validateNode(node, errors, path) {
     case "DeclareVariableStatement":
       ensureNode(node.name, errors, `${path}.name`);
       ensureNode(node.annotation, errors, `${path}.annotation`);
+      return;
+    case "DeclareExternTypeStatement":
+      ensureString(node.declarationKind, errors, `${path}.declarationKind`);
+      ensureNode(node.name, errors, `${path}.name`);
+      ensureOptionalNode(node.superName, errors, `${path}.superName`);
+      ensureArrayOfNodes(node.props, errors, `${path}.props`);
+      ensureOptionalNode(node.indexer, errors, `${path}.indexer`);
+      return;
+    case "DeclareExternTypeProperty":
+      ensureString(node.kind, errors, `${path}.kind`);
+      ensureNode(node.name, errors, `${path}.name`);
+      if (node.kind === "method") {
+        ensureArrayOfNodes(node.parameters, errors, `${path}.parameters`);
+        ensureOptionalNode(node.returnType, errors, `${path}.returnType`);
+      } else {
+        ensureNode(node.value, errors, `${path}.value`);
+      }
+      return;
+    case "DeclareExternTypeIndexer":
+      ensureNode(node.key, errors, `${path}.key`);
+      ensureNode(node.value, errors, `${path}.value`);
       return;
     case "FunctionName":
       ensureNode(node.base, errors, `${path}.base`);
@@ -450,6 +477,172 @@ function checkLoopControls(ast, errors) {
   visitStatements(ast.body || [], 0, "root.body");
 }
 
+function createConstScope(parent = null) {
+  return {
+    parent,
+    bindings: new Map(),
+  };
+}
+
+function declareConstScopeName(scope, name, kind) {
+  if (!scope || !name) {
+    return;
+  }
+  scope.bindings.set(name, kind);
+}
+
+function resolveConstScopeName(scope, name) {
+  let current = scope;
+  while (current) {
+    if (current.bindings.has(name)) {
+      return current.bindings.get(name);
+    }
+    current = current.parent;
+  }
+  return null;
+}
+
+function checkConstWriteTarget(target, scope, errors, path) {
+  if (!isNode(target)) {
+    return;
+  }
+  if (target.type === "Identifier" && resolveConstScopeName(scope, target.name) === "const") {
+    errors.push(`${path}: cannot assign to const '${target.name}'`);
+    return;
+  }
+}
+
+function checkConstWritesInExpression(expr, scope, errors, path) {
+  if (!isNode(expr)) {
+    return;
+  }
+  switch (expr.type) {
+    case "FunctionExpression": {
+      const fnScope = createConstScope(scope);
+      expr.parameters.forEach((param) => {
+        if (param && param.name) {
+          declareConstScopeName(fnScope, param.name, "local");
+        }
+      });
+      checkConstWritesInStatements(expr.body && expr.body.body ? expr.body.body : [], fnScope, errors, `${path}.body.body`);
+      return;
+    }
+    default: {
+      const children = collectChildren(expr);
+      children.forEach((child, index) => checkConstWritesInExpression(child, scope, errors, `${path}.${child.type}[${index}]`));
+    }
+  }
+}
+
+function checkConstWritesInStatements(statements, scope, errors, path) {
+  if (!Array.isArray(statements)) {
+    return;
+  }
+  for (let i = 0; i < statements.length; i += 1) {
+    const stmt = statements[i];
+    if (!isNode(stmt)) {
+      continue;
+    }
+    const stmtPath = `${path}[${i}]`;
+    switch (stmt.type) {
+      case "LocalStatement":
+        stmt.init.forEach((expr, idx) => checkConstWritesInExpression(expr, scope, errors, `${stmtPath}.init[${idx}]`));
+        stmt.variables.forEach((id) => {
+          if (id && id.name) {
+            declareConstScopeName(scope, id.name, stmt.isConst ? "const" : "local");
+          }
+        });
+        break;
+      case "AssignmentStatement":
+        stmt.init.forEach((expr, idx) => checkConstWritesInExpression(expr, scope, errors, `${stmtPath}.init[${idx}]`));
+        stmt.variables.forEach((target, idx) => {
+          checkConstWritesInExpression(target, scope, errors, `${stmtPath}.variables[${idx}]`);
+          checkConstWriteTarget(target, scope, errors, `${stmtPath}.variables[${idx}]`);
+        });
+        break;
+      case "CompoundAssignmentStatement":
+        checkConstWritesInExpression(stmt.value, scope, errors, `${stmtPath}.value`);
+        checkConstWritesInExpression(stmt.variable, scope, errors, `${stmtPath}.variable`);
+        checkConstWriteTarget(stmt.variable, scope, errors, `${stmtPath}.variable`);
+        break;
+      case "CallStatement":
+        checkConstWritesInExpression(stmt.expression, scope, errors, `${stmtPath}.expression`);
+        break;
+      case "ReturnStatement":
+        stmt.arguments.forEach((expr, idx) => checkConstWritesInExpression(expr, scope, errors, `${stmtPath}.arguments[${idx}]`));
+        break;
+      case "IfStatement":
+        stmt.clauses.forEach((clause, idx) => {
+          checkConstWritesInExpression(clause.condition, scope, errors, `${stmtPath}.clauses[${idx}].condition`);
+          checkConstWritesInStatements(clause.body.body, createConstScope(scope), errors, `${stmtPath}.clauses[${idx}].body.body`);
+        });
+        if (stmt.elseBody) {
+          checkConstWritesInStatements(stmt.elseBody.body, createConstScope(scope), errors, `${stmtPath}.elseBody.body`);
+        }
+        break;
+      case "WhileStatement":
+        checkConstWritesInExpression(stmt.condition, scope, errors, `${stmtPath}.condition`);
+        checkConstWritesInStatements(stmt.body.body, createConstScope(scope), errors, `${stmtPath}.body.body`);
+        break;
+      case "RepeatStatement": {
+        const repeatScope = createConstScope(scope);
+        checkConstWritesInStatements(stmt.body.body, repeatScope, errors, `${stmtPath}.body.body`);
+        checkConstWritesInExpression(stmt.condition, repeatScope, errors, `${stmtPath}.condition`);
+        break;
+      }
+      case "ForNumericStatement": {
+        const loopScope = createConstScope(scope);
+        checkConstWritesInExpression(stmt.start, scope, errors, `${stmtPath}.start`);
+        checkConstWritesInExpression(stmt.end, scope, errors, `${stmtPath}.end`);
+        if (stmt.step) {
+          checkConstWritesInExpression(stmt.step, scope, errors, `${stmtPath}.step`);
+        }
+        if (stmt.variable && stmt.variable.name) {
+          declareConstScopeName(loopScope, stmt.variable.name, "local");
+        }
+        checkConstWritesInStatements(stmt.body.body, loopScope, errors, `${stmtPath}.body.body`);
+        break;
+      }
+      case "ForGenericStatement": {
+        const loopScope = createConstScope(scope);
+        stmt.iterators.forEach((expr, idx) => checkConstWritesInExpression(expr, scope, errors, `${stmtPath}.iterators[${idx}]`));
+        stmt.variables.forEach((id) => {
+          if (id && id.name) {
+            declareConstScopeName(loopScope, id.name, "local");
+          }
+        });
+        checkConstWritesInStatements(stmt.body.body, loopScope, errors, `${stmtPath}.body.body`);
+        break;
+      }
+      case "DoStatement":
+        checkConstWritesInStatements(stmt.body.body, createConstScope(scope), errors, `${stmtPath}.body.body`);
+        break;
+      case "FunctionDeclaration": {
+        if (stmt.isLocal && stmt.name && stmt.name.base && stmt.name.base.name) {
+          declareConstScopeName(scope, stmt.name.base.name, "local");
+        }
+        const fnScope = createConstScope(scope);
+        if (stmt.name && stmt.name.method) {
+          declareConstScopeName(fnScope, "self", "local");
+        }
+        stmt.parameters.forEach((param) => {
+          if (param && param.name) {
+            declareConstScopeName(fnScope, param.name, "local");
+          }
+        });
+        checkConstWritesInStatements(stmt.body && stmt.body.body ? stmt.body.body : [], fnScope, errors, `${stmtPath}.body.body`);
+        break;
+      }
+      default:
+        break;
+    }
+  }
+}
+
+function checkConstWrites(ast, errors) {
+  checkConstWritesInStatements(ast.body || [], createConstScope(null), errors, "root.body");
+}
+
 function validate(ast, options = {}) {
   ast = normalizeLegacyNodeShape(ast, options);
   const errors = [];
@@ -473,6 +666,7 @@ function validate(ast, options = {}) {
   if (checkSemantics) {
     checkGotoLabels(ast, errors);
     checkLoopControls(ast, errors);
+    checkConstWrites(ast, errors);
   }
 
   if (options.throw && errors.length) {
