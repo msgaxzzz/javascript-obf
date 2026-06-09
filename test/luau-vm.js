@@ -156,6 +156,30 @@ function compileVmFunctionInstructions(sourceText, functionName) {
   return compiler.compileFunction(target).instructions;
 }
 
+function compileVmFunctionProgram(sourceText, functionName) {
+  assert(
+    vmInternals && typeof vmInternals.VmCompiler === "function",
+    "vm internals should expose VmCompiler"
+  );
+  const ast = parseCustom(sourceText);
+  let target = null;
+  walkAst(ast, (node) => {
+    if (target || !node || node.type !== "FunctionDeclaration") {
+      return;
+    }
+    const name = node.name && node.name.base && node.name.base.name;
+    if (name === functionName) {
+      target = node;
+    }
+  });
+  assert(target, `expected function ${functionName} in test source`);
+  const compiler = new vmInternals.VmCompiler({
+    style: "custom",
+    options: { vm: {} },
+  });
+  return compiler.compileFunction(target);
+}
+
 function runLuau(code) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "js-obf-luau-vm-"));
   const file = path.join(dir, "case.luau");
@@ -387,6 +411,113 @@ function runVmPreboundLocalCaptureNarrowing() {
     vmInternals.collectPreboundLocalsForFunction(ast, byName.get("withRetry")),
     [],
     "top-level local functions should not prebind unrelated earlier sibling locals"
+  );
+}
+
+function runVmProtoUpvalueDescriptorMetadata() {
+  const nestedSource = [
+    "local function outer()",
+    "  local x = 1",
+    "  local function mid()",
+    "    local function inner()",
+    "      x += 1",
+    "      return x",
+    "    end",
+    "    return inner",
+    "  end",
+    "  return mid",
+    "end",
+  ].join("\n");
+
+  const program = compileVmFunctionProgram(nestedSource, "outer");
+  assert.strictEqual(program.closures.length, 1, "outer should serialize mid as a child prototype");
+  const midClosure = program.closures[0];
+  assert.strictEqual(midClosure.upvalueDescriptors.length, 1, "mid should have one explicit upvalue descriptor");
+  assert.deepStrictEqual(
+    {
+      type: midClosure.upvalueDescriptors[0].type,
+      captureType: midClosure.upvalueDescriptors[0].captureType,
+      inStack: midClosure.upvalueDescriptors[0].inStack,
+      name: midClosure.upvalueDescriptors[0].debugName,
+      childIndex: midClosure.upvalueDescriptors[0].childIndex,
+    },
+    {
+      type: "local",
+      captureType: "ref",
+      inStack: true,
+      name: "x",
+      childIndex: 1,
+    },
+    "capturing a parent stack local should use an explicit REF descriptor"
+  );
+
+  const midProgram = midClosure.program;
+  assert.strictEqual(midProgram.closures.length, 1, "mid should serialize inner as a nested child prototype");
+  const innerDescriptor = midProgram.closures[0].upvalueDescriptors[0];
+  assert.deepStrictEqual(
+    {
+      type: innerDescriptor.type,
+      captureType: innerDescriptor.captureType,
+      inStack: innerDescriptor.inStack,
+      name: innerDescriptor.debugName,
+      childIndex: innerDescriptor.childIndex,
+      sourceType: innerDescriptor.source && innerDescriptor.source.type,
+    },
+    {
+      type: "upvalue",
+      captureType: "upvalue",
+      inStack: false,
+      name: "x",
+      childIndex: 1,
+      sourceType: "local",
+    },
+    "forwarding a parent upvalue should use an explicit UPVAL descriptor"
+  );
+
+  assert(
+    vmInternals.renderVmProtoTree(program).includes('{ 1, 1, 2, "x", 1, 2, 1 }'),
+    "serialized proto tree should include deterministic REF descriptor metadata"
+  );
+  assert(
+    vmInternals.renderVmProtoTree(program).includes('{ 2, 1, 1, "x", 0, 1, 2 }'),
+    "serialized proto tree should include deterministic UPVAL descriptor metadata"
+  );
+}
+
+function runVmCloseUpvalueInstructionCoverage() {
+  const escapingSource = [
+    "local function factory()",
+    "  local x = 0",
+    "  return function()",
+    "    x += 1",
+    "    return x",
+    "  end",
+    "end",
+  ].join("\n");
+  const escapingProgram = compileVmFunctionProgram(escapingSource, "factory");
+  assert.ok(
+    escapingProgram.instructions.some((inst) => inst[0] === "CLOSE_UPVALUES"),
+    "returning an escaping closure should emit CLOSE_UPVALUES before leaving the frame"
+  );
+
+  const repeatSource = [
+    "local function test(flag)",
+    "  local out = {}",
+    "  repeat",
+    "    local x = 1",
+    "    out[#out + 1] = function() return x end",
+    "    if flag then",
+    "      continue",
+    "    end",
+    "    flag = true",
+    "  until function() return flag and out[1]() == 1 end",
+    "  return out[1]()",
+    "end",
+  ].join("\n");
+  const repeatProgram = compileVmFunctionProgram(repeatSource, "test");
+  assert.ok(
+    repeatProgram.instructions.some((inst) => inst[0] === "CLOSE_UPVALUES"),
+    "repeat/until paths that capture body locals should emit CLOSE_UPVALUES"
   );
 }
 
@@ -1726,6 +1857,101 @@ async function runRecursiveLocalFunction() {
   assert.strictEqual(runLuau(code), "120", "local recursive functions should keep self-binding inside the VM");
 }
 
+async function runMutualRecursiveClosures() {
+  const mutualSource = [
+    "local function test()",
+    "  local A",
+    "  local B",
+    "  function A(n)",
+    "    if n <= 0 then return 'A' end",
+    "    return B(n - 1)",
+    "  end",
+    "  function B(n)",
+    "    if n <= 0 then return 'B' end",
+    "    return A(n - 1)",
+    "  end",
+    "  return A(3), B(3)",
+    "end",
+    "print(test())",
+  ].join("\n");
+
+  const code = await obfuscateSemanticVm(mutualSource, "test", "vm-mutual-recursive-closures");
+  assert.strictEqual(runLuau(code), "B\tA", "mutually recursive closures should share open upvalue cells");
+}
+
+async function runNestedShadowedCapture() {
+  const shadowSource = [
+    "local function test()",
+    "  local x = 1",
+    "  local function outer()",
+    "    local x = 2",
+    "    return function()",
+    "      return x",
+    "    end",
+    "  end",
+    "  local f = outer()",
+    "  return x, f()",
+    "end",
+    "print(test())",
+  ].join("\n");
+
+  const code = await obfuscateSemanticVm(shadowSource, "test", "vm-nested-shadowed-capture");
+  assert.strictEqual(runLuau(code), "1\t2", "nested closures should capture the nearest shadowed local");
+}
+
+async function runMethodClosureSharedCaptures() {
+  const windowSource = [
+    "local function make(size)",
+    "  local values = {}",
+    "  local cursor = 1",
+    "  local length = 0",
+    "  local window = {}",
+    "  function window:push(value)",
+    "    values[cursor] = value",
+    "    cursor += 1",
+    "    if cursor > size then cursor = 1 end",
+    "    if length < size then length += 1 end",
+    "  end",
+    "  function window:snapshot()",
+    "    local out = {}",
+    "    for i = 1, length do out[i] = values[i] end",
+    "    return out",
+    "  end",
+    "  return window",
+    "end",
+    "local w = make(2)",
+    "w:push('b')",
+    "w:push('a')",
+    "local t = w:snapshot()",
+    "print(t[1], t[2])",
+  ].join("\n");
+
+  const code = await obfuscateSemanticVm(windowSource, "make", "vm-method-closure-shared-captures");
+  assert.strictEqual(runLuau(code), "b\ta", "method closures should share captured locals across returned table methods");
+}
+
+async function runRepeatUntilCapturedLocalCloseRuntime() {
+  const repeatSource = [
+    "local function test()",
+    "  local fs = {}",
+    "  local n = 0",
+    "  repeat",
+    "    n += 1",
+    "    local x = n",
+    "    fs[#fs + 1] = function() return x end",
+    "    if n < 2 then",
+    "      continue",
+    "    end",
+    "  until (function() return n >= 2 and fs[1]() == 1 and fs[2]() == 2 end)()",
+    "  return fs[1](), fs[2]()",
+    "end",
+    "print(test())",
+  ].join("\n");
+
+  const code = await obfuscateSemanticVm(repeatSource, "test", "vm-repeat-until-captured-close-runtime");
+  assert.strictEqual(runLuau(code), "1\t2", "repeat/until captures should keep each escaped closure bound to its own local cell");
+}
+
 async function runMultiReturnAssignment() {
   const multiAssignSource = [
     "local function pair()",
@@ -2027,6 +2253,8 @@ async function runFakeOpcodeRetryTableReturnRegression() {
   runVmModeNormalizationOverride();
   runSeedRangeFix();
   runVmPreboundLocalCaptureNarrowing();
+  runVmProtoUpvalueDescriptorMetadata();
+  runVmCloseUpvalueInstructionCoverage();
   runPackedShellNormalizationDefaults();
   runPackedShellNormalizationOverride();
   runLuauOutputSizeLimit();
@@ -2057,6 +2285,8 @@ async function runFakeOpcodeRetryTableReturnRegression() {
   await runVmDisablesClassicConstArrayAndCff();
   await runGotoLabelSupport();
   await runRecursiveLocalFunction();
+  await runMutualRecursiveClosures();
+  await runNestedShadowedCapture();
   await runMultiReturnAssignment();
   await runTailReturnExpansion();
   await runTableTailCallExpansion();
@@ -2072,6 +2302,8 @@ async function runFakeOpcodeRetryTableReturnRegression() {
   await runSingleAssignmentOrdering();
   await runCapturedLocalWriteback();
   await runCapturedAnonymousClosureRead();
+  await runMethodClosureSharedCaptures();
+  await runRepeatUntilCapturedLocalCloseRuntime();
   await runFakeOpcodeRetryTableReturnRegression();
   console.log("luau-vm: ok");
 })().catch((err) => {

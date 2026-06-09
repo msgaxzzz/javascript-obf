@@ -12,7 +12,7 @@ const {
   createSharedVmRuntime,
   buildSharedVmRuntimePreludeSource,
 } = require("./vm/runtime");
-const { VmCompiler } = require("./vm/compiler");
+const { VmCompiler, collectFreeIdentifierOrderInFunction } = require("./vm/compiler");
 const { renameLuau } = require("./rename-impl");
 
 const DEFAULT_MIN_STATEMENTS = 1;
@@ -1282,6 +1282,64 @@ function buildSparseDispatch(blocks, rng, emitBlock, indent = "", { fakeEdges = 
   return lines;
 }
 
+function renderVmDataValue(value) {
+  if (value === null || value === undefined) {
+    return "nil";
+  }
+  if (typeof value === "string") {
+    return luaString(value);
+  }
+  if (typeof value === "boolean") {
+    return value ? "true" : "false";
+  }
+  return String(value);
+}
+
+function renderVmDataConstTable(consts) {
+  const entries = (Array.isArray(consts) ? consts : [])
+    .map((value, index) => `[${index + 1}] = ${renderVmDataValue(value)}`);
+  return `{ ${entries.join(", ")} }`;
+}
+
+function renderVmDataInstructionTable(instructions) {
+  const rows = compactInstructionList(Array.isArray(instructions) ? instructions : []).map((inst) => {
+    const op = inst && inst[0] ? inst[0] : "NOP";
+    return `{ ${luaString(op)}, ${inst && inst[1] ? inst[1] : 0}, ${inst && inst[2] ? inst[2] : 0} }`;
+  });
+  return `{ ${rows.join(", ")} }`;
+}
+
+function renderVmUpvalueDescriptor(desc) {
+  // Keep this table numeric so member/global masking and rename passes cannot
+  // rewrite descriptor metadata. The first slot mirrors LuauCaptureType:
+  // LCT_VAL=0, LCT_REF=1, LCT_UPVAL=2.
+  const typeId = desc && desc.type === "upvalue" ? 2 : (desc && desc.type === "value" ? 0 : 1);
+  const childIndex = desc && desc.childIndex ? desc.childIndex : 0;
+  const index = desc && desc.index ? desc.index : 0;
+  const sourceIndex = desc && desc.sourceIndex ? desc.sourceIndex : index;
+  const inStack = desc && desc.inStack === false ? 0 : 1;
+  const name = desc && (desc.debugName || desc.name) ? String(desc.debugName || desc.name) : "";
+  const sourceType = desc && desc.source && desc.source.type === "upvalue" ? 2 : (desc && desc.type === "upvalue" ? 2 : 1);
+  return `{ ${typeId}, ${childIndex}, ${sourceIndex}, ${luaString(name)}, ${inStack}, ${index}, ${sourceType} }`;
+}
+
+function renderVmProtoTree(program) {
+  const closures = Array.isArray(program && program.closures) ? program.closures : [];
+  const children = closures.map((closure) => renderVmProtoTree(closure && closure.program ? closure.program : null));
+  const descriptors = Array.isArray(program && program.upvalueDescriptors) ? program.upvalueDescriptors : [];
+  return [
+    "{",
+    `[1] = ${renderVmDataInstructionTable(program && program.instructions)},`,
+    `[2] = ${renderVmDataConstTable(program && program.consts)},`,
+    `[3] = { ${descriptors.map(renderVmUpvalueDescriptor).join(", ")} },`,
+    `[4] = { ${children.join(", ")} },`,
+    `[5] = ${program && program.paramCount ? program.paramCount : 0},`,
+    `[6] = ${program && program.hasVararg ? "true" : "false"},`,
+    `[7] = ${program && program.localCount ? program.localCount : 0}`,
+    "}",
+  ].join(" ");
+}
+
 function buildVmSource(
   program,
   opcodeInfo,
@@ -1356,13 +1414,30 @@ function buildVmSource(
     callExpanded: makeName(),
     syncLocal: makeName(),
     cell: makeName(),
+    captureCell: makeName(),
+    closeUpvalues: makeName(),
+    closeSlots: makeName(),
+    runProto: makeName(),
+    protoTree: makeName(),
+    makeProtoClosure: makeName(),
+    slotValue: makeName(),
+    slotSet: makeName(),
+    slotDeclare: makeName(),
+    localLimit: makeName(),
     localValue: makeName(),
     localSet: makeName(),
     localDeclare: makeName(),
     closureFactory: makeName(),
     varargs: makeName(),
+    globalFast: makeName(),
+    globalFastKeyNext: makeName(),
+    globalFastKeyGetmetatable: makeName(),
   };
-  const renderInitValue = (entry) => {
+  const syncSetterTable = makeName();
+  const renderInitValue = (entry, index) => {
+    const setterExpr = setTargets && typeof setTargets[index] === "string"
+      ? `${syncSetterTable}[${index + 1}]`
+      : "nil";
     if (!entry) {
       return "nil";
     }
@@ -1370,11 +1445,11 @@ function buildVmSource(
       return String(entry.cell);
     }
     if (typeof entry === "object" && entry.expr) {
-      return `${helperNames.cell}(${entry.expr})`;
+      return `${helperNames.cell}(${entry.expr}, ${setterExpr})`;
     }
-    return `${helperNames.cell}(${entry})`;
+    return `${helperNames.cell}(${entry}, ${setterExpr})`;
   };
-  const localsInit = (initValues || []).map(renderInitValue);
+  const localsInit = (initValues || []).map((entry, index) => renderInitValue(entry, index));
   const localsTable = `{ ${localsInit.join(", ")} }`;
   const vmStateNames = {
     bcKeyCount: makeName(),
@@ -1523,11 +1598,24 @@ function buildVmSource(
         ]);
       case "PUSH_CLOSURE":
         return finish([pushLine, `stack[top] = ${helperNames.closureFactory}[${aExpr}](locals)`]);
+      case "CLOSE_UPVALUES":
+        return finish([
+          `${helperNames.closeUpvalues}(${aExpr})`,
+        ]);
       case "PUSH_GLOBAL":
-        return finish([pushLine, `stack[top] = env[${getConstExpr(aExpr)}]`]);
+        return finish([
+          "local key = " + getConstExpr(aExpr),
+          `local value = ${helperNames.globalFast}[key]`,
+          "if value == nil then value = env[key] end",
+          pushLine,
+          "stack[top] = value",
+        ]);
       case "SET_GLOBAL":
         return finish([
-          `env[${getConstExpr(aExpr)}] = stack[top]`,
+          "local key = " + getConstExpr(aExpr),
+          "local value = stack[top]",
+          "env[key] = value",
+          `${helperNames.globalFast}[key] = value`,
           "stack[top] = nil",
           "top = top - 1",
         ]);
@@ -1818,7 +1906,7 @@ end)()`);
           `local ctrl = ${helperNames.localValue}(ctrlSlot)`,
           `local kind = ${runtimeTools.type}(gen)`,
           `if kind == "table" or kind == "userdata" then`,
-          `  local mtfn = env["getmetatable"] or getmetatable`,
+          `  local mtfn = ${helperNames.globalFast}[${helperNames.globalFastKeyGetmetatable}] or env[${helperNames.globalFastKeyGetmetatable}]`,
           "  local mt = mtfn and mtfn(gen)",
           `  local mtKind = ${runtimeTools.type}(mt)`,
           "  local iter = mtKind == \"table\" and mt.__iter or nil",
@@ -1827,7 +1915,7 @@ end)()`);
           "    gen, state, ctrl = iter(gen)",
           "  elseif kind == \"table\" and callMeta == nil then",
           "    state = gen",
-          "    gen = env[\"next\"] or next",
+          `    gen = ${helperNames.globalFast}[${helperNames.globalFastKeyNext}] or env[${helperNames.globalFastKeyNext}]`,
           "    ctrl = nil",
           "  end",
           "end",
@@ -1836,40 +1924,84 @@ end)()`);
           `${helperNames.localSet}(ctrlSlot, ctrl)`,
         ]);
       case "JMP_IF_LOCAL_LT":
+        if (mode === "block") {
+          return [
+            `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
+            `local right = ${aExpr} % 65536`,
+            `if ${helperNames.localValue}(left) < ${helperNames.localValue}(right) then`,
+            `  pc = ${bExpr}`,
+            "else",
+            `  pc = ${nextExpr}`,
+            "end",
+          ];
+        }
         return [
           `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
           `local right = ${aExpr} % 65536`,
           `if ${helperNames.localValue}(left) < ${helperNames.localValue}(right) then`,
-          mode === "block" ? `  pc = ${bExpr}` : `  return ${bExpr}, false, nil`,
+          `  return ${bExpr}, false, nil`,
           "end",
-          mode === "block" ? `pc = ${nextExpr}` : `return ${nextExpr}, false, nil`,
+          `return ${nextExpr}, false, nil`,
         ];
       case "JMP_IF_LOCAL_GT":
+        if (mode === "block") {
+          return [
+            `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
+            `local right = ${aExpr} % 65536`,
+            `if ${helperNames.localValue}(left) > ${helperNames.localValue}(right) then`,
+            `  pc = ${bExpr}`,
+            "else",
+            `  pc = ${nextExpr}`,
+            "end",
+          ];
+        }
         return [
           `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
           `local right = ${aExpr} % 65536`,
           `if ${helperNames.localValue}(left) > ${helperNames.localValue}(right) then`,
-          mode === "block" ? `  pc = ${bExpr}` : `  return ${bExpr}, false, nil`,
+          `  return ${bExpr}, false, nil`,
           "end",
-          mode === "block" ? `pc = ${nextExpr}` : `return ${nextExpr}, false, nil`,
+          `return ${nextExpr}, false, nil`,
         ];
       case "JMP_IF_LOCAL_LE":
+        if (mode === "block") {
+          return [
+            `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
+            `local right = ${aExpr} % 65536`,
+            `if ${helperNames.localValue}(left) <= ${helperNames.localValue}(right) then`,
+            `  pc = ${bExpr}`,
+            "else",
+            `  pc = ${nextExpr}`,
+            "end",
+          ];
+        }
         return [
           `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
           `local right = ${aExpr} % 65536`,
           `if ${helperNames.localValue}(left) <= ${helperNames.localValue}(right) then`,
-          mode === "block" ? `  pc = ${bExpr}` : `  return ${bExpr}, false, nil`,
+          `  return ${bExpr}, false, nil`,
           "end",
-          mode === "block" ? `pc = ${nextExpr}` : `return ${nextExpr}, false, nil`,
+          `return ${nextExpr}, false, nil`,
         ];
       case "JMP_IF_LOCAL_GE":
+        if (mode === "block") {
+          return [
+            `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
+            `local right = ${aExpr} % 65536`,
+            `if ${helperNames.localValue}(left) >= ${helperNames.localValue}(right) then`,
+            `  pc = ${bExpr}`,
+            "else",
+            `  pc = ${nextExpr}`,
+            "end",
+          ];
+        }
         return [
           `local left = ${runtimeTools.floor}(${aExpr} / 65536)`,
           `local right = ${aExpr} % 65536`,
           `if ${helperNames.localValue}(left) >= ${helperNames.localValue}(right) then`,
-          mode === "block" ? `  pc = ${bExpr}` : `  return ${bExpr}, false, nil`,
+          `  return ${bExpr}, false, nil`,
           "end",
-          mode === "block" ? `pc = ${nextExpr}` : `return ${nextExpr}, false, nil`,
+          `return ${nextExpr}, false, nil`,
         ];
       case "JMP_IF_FALSE":
         if (mode === "block") {
@@ -2516,7 +2648,22 @@ end)()`);
   }
 
   lines.push(
-    `local function ${helperNames.cell}(value) return { value } end`,
+    `local function ${helperNames.cell}(value, setter) return { value, false, false, setter } end`,
+    `local ${syncSetterTable} = {}`,
+  );
+  if (setTargets && setTargets.length) {
+    setTargets.forEach((target, index) => {
+      if (!target || typeof target === "object") {
+        return;
+      }
+      const setterName = makeVmHelperAliasName();
+      lines.push(`local function ${setterName}(nextValue)`);
+      lines.push(`  ${target} = nextValue`);
+      lines.push(`end`);
+      lines.push(`${syncSetterTable}[${index + 1}] = ${setterName}`);
+    });
+  }
+  lines.push(
     `local locals = ${localsTable}`,
     `local stack = {}`,
     `local top = 0`,
@@ -2562,6 +2709,59 @@ end)()`);
       `end`,
     );
   }
+  const globalFastKeys = [
+    "print",
+    "pairs",
+    "ipairs",
+    "next",
+    "tostring",
+    "tonumber",
+    "type",
+    "error",
+    "pcall",
+    "select",
+    "assert",
+    "setmetatable",
+    "getmetatable",
+    "rawget",
+    "rawset",
+    "rawequal",
+    "rawlen",
+    "coroutine",
+    "string",
+    "table",
+    "math",
+    "bit32",
+    "utf8",
+    "buffer",
+    "vector",
+    "os",
+  ];
+  lines.push(
+    `local ${helperNames.globalFast} = {}`,
+    `local ${helperNames.globalFastKeyNext} = ${charExpr("next")}`,
+    `local ${helperNames.globalFastKeyGetmetatable} = ${charExpr("getmetatable")}`,
+    `do`,
+    `  local key`,
+  );
+  for (const key of globalFastKeys) {
+    const keyExpr = key === "next"
+      ? helperNames.globalFastKeyNext
+      : key === "getmetatable"
+        ? helperNames.globalFastKeyGetmetatable
+        : charExpr(key);
+    lines.push(
+      `  key = ${keyExpr}`,
+      `  ${helperNames.globalFast}[key] = env[key]`,
+    );
+  }
+  lines.push(
+    `  key = ${charExpr("_G")}`,
+    `  ${helperNames.globalFast}[key] = env`,
+    `  key = ${charExpr("_ENV")}`,
+    `  ${helperNames.globalFast}[key] = env`,
+    `end`,
+  );
   if (program && program.hasVararg) {
     lines.push(`local ${helperNames.varargs} = pack(...)`);
   } else {
@@ -2587,20 +2787,6 @@ end)()`);
   lines.push(`  local args = ${helperNames.expandArgs}(prefix, tail)`);
   lines.push(`  return pack(fn(unpack(args, 1, args.n or #args)))`);
   lines.push(`end`);
-  const syncSetterTable = makeName();
-  lines.push(`local ${syncSetterTable} = {}`);
-  if (setTargets && setTargets.length) {
-    setTargets.forEach((target, index) => {
-      if (!target || typeof target === "object") {
-        return;
-      }
-      const setterName = makeVmHelperAliasName();
-      lines.push(`local function ${setterName}(nextValue)`);
-      lines.push(`  ${target} = nextValue`);
-      lines.push(`end`);
-      lines.push(`${syncSetterTable}[${index + 1}] = ${setterName}`);
-    });
-  }
   lines.push(`local function ${helperNames.syncLocal}(idx, value)`);
   lines.push(`  local setter = ${syncSetterTable}[idx]`);
   lines.push(`  if setter then`);
@@ -2608,97 +2794,214 @@ end)()`);
   lines.push(`  end`);
   lines.push(`  return`);
   lines.push(`end`);
-  lines.push(`local function ${helperNames.localValue}(idx)`);
-  lines.push(`  local slot = locals[idx]`);
+  lines.push(`local ${helperNames.localLimit} = ${program && program.localCount ? program.localCount : 0}`);
+  lines.push(`local function ${helperNames.slotValue}(slots, idx)`);
+  lines.push(`  local slot = slots[idx]`);
   lines.push(`  if slot == nil then return nil end`);
   lines.push(`  return slot[1]`);
   lines.push(`end`);
-  lines.push(`local function ${helperNames.localSet}(idx, value)`);
-  lines.push(`  local slot = locals[idx]`);
+  lines.push(`local function ${helperNames.slotSet}(slots, idx, value, setters)`);
+  lines.push(`  local slot = slots[idx]`);
   lines.push(`  if slot == nil then`);
-  lines.push(`    slot = ${helperNames.cell}(nil)`);
-  lines.push(`    locals[idx] = slot`);
+  lines.push(`    local setter = setters and setters[idx] or nil`);
+  lines.push(`    slot = ${helperNames.cell}(nil, setter)`);
+  lines.push(`    slots[idx] = slot`);
+  lines.push(`  elseif setters ~= nil and slot[4] == nil then`);
+  lines.push(`    slot[4] = setters[idx]`);
   lines.push(`  end`);
   lines.push(`  slot[1] = value`);
-  lines.push(`  ${helperNames.syncLocal}(idx, value)`);
+  lines.push(`  local setter = slot[4]`);
+  lines.push(`  if setter then setter(value) end`);
+  lines.push(`end`);
+  lines.push(`local function ${helperNames.slotDeclare}(slots, idx, value, setters)`);
+  lines.push(`  local setter = setters and setters[idx] or nil`);
+  lines.push(`  slots[idx] = ${helperNames.cell}(value, setter)`);
+  lines.push(`  if setter then setter(value) end`);
+  lines.push(`end`);
+  lines.push(`local function ${helperNames.localValue}(idx)`);
+  lines.push(`  return ${helperNames.slotValue}(locals, idx)`);
+  lines.push(`end`);
+  lines.push(`local function ${helperNames.localSet}(idx, value)`);
+  lines.push(`  ${helperNames.slotSet}(locals, idx, value, ${syncSetterTable})`);
   lines.push(`end`);
   lines.push(`local function ${helperNames.localDeclare}(idx, value)`);
-  lines.push(`  locals[idx] = ${helperNames.cell}(value)`);
-  lines.push(`  ${helperNames.syncLocal}(idx, value)`);
+  lines.push(`  ${helperNames.slotDeclare}(locals, idx, value, ${syncSetterTable})`);
+  lines.push(`end`);
+  lines.push(`local function ${helperNames.captureCell}(slots, idx, setters)`);
+  lines.push(`  local slot = slots[idx]`);
+  lines.push(`  if slot == nil then`);
+  lines.push(`    local setter = setters and setters[idx] or nil`);
+  lines.push(`    slot = ${helperNames.cell}(nil, setter)`);
+  lines.push(`    slots[idx] = slot`);
+  lines.push(`  elseif setters ~= nil and slot[4] == nil then`);
+  lines.push(`    slot[4] = setters[idx]`);
+  lines.push(`  end`);
+  lines.push(`  slot[3] = true`);
+  lines.push(`  return slot`);
+  lines.push(`end`);
+  lines.push(`local function ${helperNames.closeSlots}(slots, start, limit, setters)`);
+  lines.push(`  for idx = start, limit do`);
+  lines.push(`    local slot = slots[idx]`);
+  lines.push(`    if slot ~= nil and slot[3] then`);
+  lines.push(`      slot[2] = true`);
+  lines.push(`      local setter = slot[4] or (setters and setters[idx] or nil)`);
+  lines.push(`      slots[idx] = ${helperNames.cell}(nil, setter)`);
+  lines.push(`    end`);
+  lines.push(`  end`);
+  lines.push(`end`);
+  lines.push(`local function ${helperNames.closeUpvalues}(start)`);
+  lines.push(`  ${helperNames.closeSlots}(locals, start, ${helperNames.localLimit}, ${syncSetterTable})`);
+  lines.push(`end`);
+  const protoRoot = program
+    ? { ...program, instructions: [], consts: [], upvalueDescriptors: [] }
+    : null;
+  const protoNoiseStateName = makeName();
+  const protoNames = {
+    upvalues: makeName(),
+    descriptors: makeName(),
+    desc: makeName(),
+    sourceIndex: makeName(),
+    locals: "locals",
+    args: makeName(),
+    upvalueCount: makeName(),
+    paramCount: makeName(),
+    argCount: makeName(),
+    varargCount: makeName(),
+    consts: makeName(),
+    instructions: makeName(),
+    children: makeName(),
+    localLimit: makeName(),
+    pc: "pc",
+    inst: makeName(),
+    op: "op",
+    a: "a",
+    b: "b",
+    childIndex: makeName(),
+    childProto: makeName(),
+  };
+  lines.push(`local ${helperNames.protoTree} = ${renderVmProtoTree(protoRoot)}`);
+  lines.push(`local ${helperNames.runProto}`);
+  lines.push(`local ${helperNames.makeProtoClosure}`);
+  lines.push(`${helperNames.makeProtoClosure} = function(proto, parentSlots)`);
+  lines.push(`  if proto == nil then`);
+  lines.push(`    return function() return end`);
+  lines.push(`  end`);
+  lines.push(`  local ${protoNames.upvalues} = {}`);
+  lines.push(`  local ${protoNames.descriptors} = proto[3] or {}`);
+  lines.push(`  for ui = 1, #${protoNames.descriptors} do`);
+  lines.push(`    local ${protoNames.desc} = ${protoNames.descriptors}[ui]`);
+  lines.push(`    local ${protoNames.sourceIndex} = (${protoNames.desc} and (${protoNames.desc}[3] or ${protoNames.desc}[6] or ${protoNames.desc}[2])) or 0`);
+  lines.push(`    if ${protoNames.desc} and ${protoNames.desc}[1] == 0 then`);
+  lines.push(`      ${protoNames.upvalues}[ui] = ${helperNames.cell}(${helperNames.slotValue}(parentSlots, ${protoNames.sourceIndex}), nil)`);
+  lines.push(`    else`);
+  lines.push(`      ${protoNames.upvalues}[ui] = ${helperNames.captureCell}(parentSlots, ${protoNames.sourceIndex}, nil)`);
+  lines.push(`    end`);
+  lines.push(`  end`);
+  lines.push(`  return function(...)`);
+  lines.push(`    return ${helperNames.runProto}(proto, ${protoNames.upvalues}, ...)`);
+  lines.push(`  end`);
+  lines.push(`end`);
+  lines.push(`${helperNames.runProto} = function(proto, __vm_upvalues, ...)`);
+  lines.push(`  if proto == nil then return end`);
+  lines.push(`  local ${protoNames.locals} = {}`);
+  lines.push(`  local stack = {}`);
+  lines.push(`  local top = 0`);
+  lines.push(`  local ${protoNames.consts} = proto[2] or {}`);
+  lines.push(`  local ${protoNames.instructions} = proto[1] or {}`);
+  lines.push(`  local ${protoNames.children} = proto[4] or {}`);
+  lines.push(`  local ${protoNames.localLimit} = proto[7] or 0`);
+  lines.push(`  local ${protoNames.args} = pack(...)`);
+  lines.push(`  local ${protoNames.upvalueCount} = __vm_upvalues and #__vm_upvalues or 0`);
+  lines.push(`  for idx = 1, ${protoNames.upvalueCount} do`);
+  lines.push(`    ${protoNames.locals}[idx] = __vm_upvalues[idx]`);
+  lines.push(`  end`);
+  lines.push(`  local ${protoNames.paramCount} = proto[5] or 0`);
+  lines.push(`  for idx = 1, ${protoNames.paramCount} do`);
+  lines.push(`    ${protoNames.locals}[${protoNames.upvalueCount} + idx] = ${helperNames.cell}(${protoNames.args}[idx], nil)`);
+  lines.push(`  end`);
+  lines.push(`  local ${helperNames.varargs}`);
+  lines.push(`  if proto[6] then`);
+  lines.push(`    local ${protoNames.argCount} = ${protoNames.args}.n or #${protoNames.args}`);
+  lines.push(`    local ${protoNames.varargCount} = ${protoNames.argCount} - ${protoNames.paramCount}`);
+  lines.push(`    if ${protoNames.varargCount} < 0 then ${protoNames.varargCount} = 0 end`);
+  lines.push(`    ${helperNames.varargs} = { n = ${protoNames.varargCount} }`);
+  lines.push(`    for idx = 1, ${protoNames.varargCount} do`);
+  lines.push(`      ${helperNames.varargs}[idx] = ${protoNames.args}[${protoNames.paramCount} + idx]`);
+  lines.push(`    end`);
+  lines.push(`  else`);
+  lines.push(`    ${helperNames.varargs} = { n = 0 }`);
+  lines.push(`  end`);
+  lines.push(`  local function ${helperNames.getConst}(idx)`);
+  lines.push(`    return ${protoNames.consts}[idx]`);
+  lines.push(`  end`);
+  lines.push(`  local function ${helperNames.localValue}(idx)`);
+  lines.push(`    return ${helperNames.slotValue}(${protoNames.locals}, idx)`);
+  lines.push(`  end`);
+  lines.push(`  local function ${helperNames.localSet}(idx, value)`);
+  lines.push(`    ${helperNames.slotSet}(${protoNames.locals}, idx, value, nil)`);
+  lines.push(`  end`);
+  lines.push(`  local function ${helperNames.localDeclare}(idx, value)`);
+  lines.push(`    ${helperNames.slotDeclare}(${protoNames.locals}, idx, value, nil)`);
+  lines.push(`  end`);
+  lines.push(`  local function ${helperNames.closeUpvalues}(start)`);
+  lines.push(`    ${helperNames.closeSlots}(${protoNames.locals}, start, ${protoNames.localLimit}, nil)`);
+  lines.push(`  end`);
+  lines.push(`  local ${helperNames.closureFactory} = {}`);
+  lines.push(`  for ${protoNames.childIndex} = 1, #${protoNames.children} do`);
+  lines.push(`    local ${protoNames.childProto} = ${protoNames.children}[${protoNames.childIndex}]`);
+  lines.push(`    ${helperNames.closureFactory}[${protoNames.childIndex}] = function(parentSlots)`);
+  lines.push(`      return ${helperNames.makeProtoClosure}(${protoNames.childProto}, parentSlots)`);
+  lines.push(`    end`);
+  lines.push(`  end`);
+  lines.push(`  local ${protoNoiseStateName} = {}`);
+  lines.push(`  local pc = 1`);
+  lines.push(`  while true do`);
+  lines.push(`    local ${protoNames.inst} = ${protoNames.instructions}[pc]`);
+  lines.push(`    if ${protoNames.inst} == nil then return end`);
+  lines.push(`    local op = ${protoNames.inst}[1] or "NOP"`);
+  lines.push(`    local a = ${protoNames.inst}[2] or 0`);
+  lines.push(`    local b = ${protoNames.inst}[3] or 0`);
+  lines.push(`    if false then`);
+  const protoInterpreterOps = Array.from(new Set([
+    ...OPCODES,
+    ...NOISE_OPCODES,
+    "ADD_REG_LOCAL",
+    "ADD_REG_CONST",
+    "SUB_REG_LOCAL",
+    "SUB_REG_CONST",
+    "JMP_IF_LOCAL_LT",
+    "JMP_IF_LOCAL_GT",
+    "JMP_IF_LOCAL_LE",
+    "JMP_IF_LOCAL_GE",
+    "PUSH_LOCAL_ADD_LOCAL",
+    "PUSH_LOCAL_SUB_LOCAL",
+    "PUSH_CONST_ADD_CONST",
+  ]));
+  protoInterpreterOps.forEach((opName) => {
+    const body = emitSharedOpBody(opName, {
+      mode: "block",
+      nextExpr: opName === "JMP" ? "a" : "pc + 1",
+      aExpr: "a",
+      bExpr: "b",
+      jumpTargetExpr: "a",
+      noiseStateName: protoNoiseStateName,
+    });
+    lines.push(`    elseif op == ${luaString(opName)} then`);
+    body.forEach((line) => lines.push(`      ${line}`));
+  });
+  lines.push(`    else`);
+  lines.push(`      return`);
+  lines.push(`    end`);
+  lines.push(`  end`);
   lines.push(`end`);
   lines.push(`local ${helperNames.closureFactory} = {}`);
   if (program && Array.isArray(program.closures) && program.closures.length) {
     program.closures.forEach((closure, index) => {
-      const nestedProgram = closure && closure.program ? closure.program : null;
-      if (!nestedProgram) {
+      if (!closure || !closure.program) {
         return;
       }
-      const nestedOpcodeList = Array.from(new Set([
-        ...OPCODES,
-        ...NOISE_OPCODES,
-        ...(nestedProgram.instructions || [])
-          .map((inst) => inst && inst[0])
-          .filter((name) => typeof name === "string"),
-      ]));
-      const nestedOpcodeMap = buildOpcodeMap(null, false, nestedOpcodeList);
-      nestedProgram.instructions = compactInstructionList(nestedProgram.instructions || []).map((inst) => {
-        if (!inst || typeof inst[0] !== "string") {
-          return inst;
-        }
-        const opName = inst[0];
-        const width = getOpcodeArity(opName);
-        const out = [nestedOpcodeMap[opName]];
-        if (width >= 1) {
-          out.push(inst[1] || 0);
-        }
-        if (width >= 2) {
-          out.push(inst[2] || 0);
-        }
-        return out;
-      });
-      const nestedOptions = {
-        ...vmOptions,
-        blockDispatch: false,
-        bytecodeEncrypt: false,
-        constsEncrypt: false,
-        constsSplit: false,
-        runtimeKey: false,
-        runtimeSplit: false,
-        decoyRuntime: false,
-        symbolNoise: false,
-        dynamicCoupling: false,
-      };
-      const nestedBuilt = buildVmSource(
-        nestedProgram,
-        null,
-        nestedProgram.paramNames || [],
-        null,
-        null,
-        null,
-        null,
-        rng,
-        nestedOptions,
-        reservedNames,
-        nestedOpcodeList,
-        null,
-        sharedRuntime
-      );
-      const nestedSource = typeof nestedBuilt === "string" ? nestedBuilt : nestedBuilt.source;
-      const params = (nestedProgram.paramNames || [])
-        .map((name, paramIndex) => (name && typeof name === "string" ? name : `_${paramIndex + 1}`));
-      if (nestedProgram.hasVararg) {
-        params.push("...");
-      }
       lines.push(`${helperNames.closureFactory}[${index + 1}] = function(__vm_parent_locals)`);
-      const captureCells = Array.isArray(closure.captures) && closure.captures.length
-        ? closure.captures.map((capture) => `__vm_parent_locals[${capture.index}]`).join(", ")
-        : "";
-      lines.push(`  local __vm_captures = { ${captureCells} }`);
-      lines.push(`  return function(${params.join(", ")})`);
-      nestedSource.split("\n").forEach((line) => {
-        lines.push(`    ${line}`);
-      });
-      lines.push(`  end`);
+      lines.push(`  return ${helperNames.makeProtoClosure}(${helperNames.protoTree}[4][${index + 1}], __vm_parent_locals)`);
       lines.push(`end`);
     });
   }
@@ -3988,10 +4291,7 @@ function collectPreboundLocalsForFunction(ast, fnNode) {
     return [];
   }
 
-  const declared = collectDeclaredNamesInFunction(fnNode);
-  const prebound = collectUsedIdentifierOrder(fnNode).filter((name) => (
-    !declared.has(name) && visibleBindings.has(name)
-  ));
+  const prebound = collectFreeIdentifierOrderInFunction(fnNode).filter((name) => visibleBindings.has(name));
   astCache.set(fnNode, prebound);
   return prebound;
 }
@@ -4510,5 +4810,6 @@ module.exports = {
     computeSeedFromPieces,
     VmCompiler,
     collectPreboundLocalsForFunction,
+    renderVmProtoTree,
   },
 };

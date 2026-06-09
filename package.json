@@ -10,6 +10,9 @@
   },
   "scripts": {
     "obf": "node bin/js-obf",
+    "test": "npm run typecheck && npm run build:ts && npm run test:luau && npm run test:vm",
+    "test:luau": "node test/luau-official-grammar.js && node test/luau-custom-roundtrip.js && node test/luau-custom-ast-contract.js && node test/luau-custom-scope.js && node test/luau-custom-declarations.js && node test/luau-compiler-fuzz.js && node test/luau-conformance.js && node test/luau-api.js && node test/luau-cff.js && node test/luau-rename.js && node test/luau-mask-globals.js && node test/luau-short-runtime-names.js && node test/luau-advanced.js && node test/luau-strings.js && node test/luau-long-strings.js && node test/luau-postprocess.js && node test/luau-official-shape.js && node test/luau-debug.js && node test/luau-obf.js && node test/luau-proxify.js && node test/luau-runtime-loader.js && node test/luau-ssa-cache.js && node test/luau-typescript-bootstrap.js && node test/obf-smoke.js && node test/web-cli-args.js",
+    "test:vm": "node test/luau-vm-coverage.js && node test/luau-vm.js",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "build:ts": "tsc -p tsconfig.build.json"
   },

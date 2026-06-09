@@ -127,6 +127,79 @@ function collectUsedIdentifierOrderInFunction(fnNode) {
   return names;
 }
 
+function getFunctionBodyStatementsForCapture(fnNode) {
+  if (!fnNode) {
+    return [];
+  }
+  if (Array.isArray(fnNode.body)) {
+    return fnNode.body;
+  }
+  if (fnNode.body && Array.isArray(fnNode.body.body)) {
+    return fnNode.body.body;
+  }
+  return [];
+}
+
+function getStatementBodyStatementsForCapture(body) {
+  if (!body) {
+    return [];
+  }
+  if (Array.isArray(body)) {
+    return body;
+  }
+  if (body.body && Array.isArray(body.body)) {
+    return body.body;
+  }
+  return [];
+}
+
+function declareIdentifierInScope(scope, node) {
+  if (scope && node && node.type === "Identifier" && node.name) {
+    scope.add(node.name);
+  }
+}
+
+function declareLocalFunctionName(scope, node) {
+  if (!scope || !node || node.type !== "FunctionDeclaration" || !node.isLocal) {
+    return;
+  }
+  const name = node.name && node.name.base && node.name.base.name;
+  if (name && !(node.name.members && node.name.members.length) && !node.name.method) {
+    scope.add(name);
+  }
+}
+
+function resolveInScopeStack(scopes, name) {
+  for (let idx = scopes.length - 1; idx >= 0; idx -= 1) {
+    if (scopes[idx].has(name)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function isTypeSyntaxNode(node, key = null) {
+  if (!node || typeof node !== "object") {
+    return false;
+  }
+  if (typeof key === "string" && (
+    key === "typeAnnotation" ||
+    key === "returnType" ||
+    key === "varargAnnotation" ||
+    key === "typeParameters" ||
+    key === "genericParameters" ||
+    key === "typeParams"
+  )) {
+    return true;
+  }
+  return typeof node.type === "string" && (
+    node.type === "TypeAnnotation" ||
+    node.type.startsWith("Type") ||
+    node.type.endsWith("Type") ||
+    node.type.includes("TypePack")
+  );
+}
+
 function appendUniqueName(names, seen, name) {
   if (!name || seen.has(name)) {
     return;
@@ -136,38 +209,146 @@ function appendUniqueName(names, seen, name) {
 }
 
 function collectFreeIdentifierOrderInFunction(fnNode) {
-  const declared = collectDeclaredNamesInFunction(fnNode);
+  if (!collectFreeIdentifierOrderInFunction.cache) {
+    collectFreeIdentifierOrderInFunction.cache = new WeakMap();
+  }
+  const cache = collectFreeIdentifierOrderInFunction.cache;
+  if (cache.has(fnNode)) {
+    return cache.get(fnNode);
+  }
+
   const names = [];
   const seen = new Set();
+  const scopes = [new Set()];
 
-  const visit = (node, parent = null, key = null) => {
+  const addIfFree = (name) => {
+    if (!resolveInScopeStack(scopes, name)) {
+      appendUniqueName(names, seen, name);
+    }
+  };
+
+  const visitNestedFunction = (node) => {
+    collectFreeIdentifierOrderInFunction(node).forEach(addIfFree);
+  };
+
+  const visitExpression = (node, parent = null, key = null) => {
     if (!node || typeof node !== "object") {
       return;
     }
     if (Array.isArray(node)) {
-      node.forEach((item) => visit(item, parent, key));
+      node.forEach((item, index) => visitExpression(item, parent, index));
+      return;
+    }
+    if (isTypeSyntaxNode(node, key)) {
       return;
     }
     if (node !== fnNode && isFunctionNode(node)) {
-      collectFreeIdentifierOrderInFunction(node).forEach((name) => {
-        if (!declared.has(name)) {
-          appendUniqueName(names, seen, name);
-        }
-      });
+      visitNestedFunction(node);
       return;
     }
     if (node.type === "Identifier" && node.name && isReferenceIdentifier(node, parent, key)) {
-      if (!declared.has(node.name)) {
-        appendUniqueName(names, seen, node.name);
-      }
+      addIfFree(node.name);
       return;
     }
     Object.keys(node).forEach((childKey) => {
-      visit(node[childKey], node, childKey);
+      visitExpression(node[childKey], node, childKey);
     });
   };
 
-  visit(fnNode);
+  const visitStatementList = (statements, scoped = false) => {
+    if (scoped) {
+      scopes.push(new Set());
+    }
+    for (const stmt of statements || []) {
+      visitStatement(stmt);
+    }
+    if (scoped) {
+      scopes.pop();
+    }
+  };
+
+  const visitIfClauses = (stmt) => {
+    const clauses = [];
+    if (Array.isArray(stmt.clauses)) {
+      stmt.clauses.forEach((clause) => {
+        clauses.push({
+          condition: clause && clause.type === "ElseClause" ? null : clause.condition,
+          body: getStatementBodyStatementsForCapture(clause && clause.body),
+        });
+      });
+    }
+    if (stmt.elseBody) {
+      clauses.push({ condition: null, body: getStatementBodyStatementsForCapture(stmt.elseBody) });
+    }
+    clauses.forEach((clause) => {
+      if (clause.condition) {
+        visitExpression(clause.condition, stmt, "condition");
+      }
+      visitStatementList(clause.body, true);
+    });
+  };
+
+  const visitStatement = (stmt) => {
+    if (!stmt || typeof stmt !== "object") {
+      return;
+    }
+    if (isTypeSyntaxNode(stmt)) {
+      return;
+    }
+
+    switch (stmt.type) {
+      case "LocalStatement":
+        (stmt.init || []).forEach((expr, index) => visitExpression(expr, stmt, index));
+        (stmt.variables || []).forEach((variable) => declareIdentifierInScope(scopes[scopes.length - 1], variable));
+        return;
+      case "FunctionDeclaration":
+        if (stmt.isLocal) {
+          declareLocalFunctionName(scopes[scopes.length - 1], stmt);
+        } else if (stmt.name && stmt.name.base) {
+          visitExpression(stmt.name.base, stmt.name, "base");
+        }
+        visitNestedFunction(stmt);
+        return;
+      case "IfStatement":
+        visitIfClauses(stmt);
+        return;
+      case "WhileStatement":
+        visitExpression(stmt.condition, stmt, "condition");
+        visitStatementList(getStatementBodyStatementsForCapture(stmt.body), true);
+        return;
+      case "RepeatStatement":
+        scopes.push(new Set());
+        visitStatementList(getStatementBodyStatementsForCapture(stmt.body), false);
+        visitExpression(stmt.condition, stmt, "condition");
+        scopes.pop();
+        return;
+      case "ForNumericStatement":
+        visitExpression(stmt.start, stmt, "start");
+        visitExpression(stmt.end, stmt, "end");
+        visitExpression(stmt.step, stmt, "step");
+        scopes.push(new Set());
+        declareIdentifierInScope(scopes[scopes.length - 1], stmt.variable);
+        visitStatementList(getStatementBodyStatementsForCapture(stmt.body), false);
+        scopes.pop();
+        return;
+      case "ForGenericStatement":
+        (stmt.iterators || []).forEach((expr, index) => visitExpression(expr, stmt, index));
+        scopes.push(new Set());
+        (stmt.variables || []).forEach((variable) => declareIdentifierInScope(scopes[scopes.length - 1], variable));
+        visitStatementList(getStatementBodyStatementsForCapture(stmt.body), false);
+        scopes.pop();
+        return;
+      case "DoStatement":
+        visitStatementList(getStatementBodyStatementsForCapture(stmt.body), true);
+        return;
+      default:
+        visitExpression(stmt, null, null);
+    }
+  };
+
+  (fnNode.parameters || []).forEach((param) => declareIdentifierInScope(scopes[0], param));
+  visitStatementList(getFunctionBodyStatementsForCapture(fnNode), false);
+  cache.set(fnNode, names);
   return names;
 }
 
@@ -216,10 +397,14 @@ class Scope {
   constructor(parent = null) {
     this.parent = parent;
     this.bindings = new Map();
+    this.locals = [];
   }
 
   define(name, index, meta = null) {
-    this.bindings.set(name, { index, meta: meta || {} });
+    const binding = { name, index, meta: meta || {}, captured: false };
+    this.bindings.set(name, binding);
+    this.locals.push(binding);
+    return binding;
   }
 
   resolveBinding(name) {
@@ -253,6 +438,7 @@ class VmCompiler {
     this.userLabelNames = new Map();
     this.functionHasVararg = false;
     this.closures = [];
+    this.localBindings = new Map();
   }
 
   nextTemp() {
@@ -283,7 +469,8 @@ class VmCompiler {
 
   defineLocal(name, meta = null) {
     this.localCount += 1;
-    this.scope.define(name, this.localCount, meta);
+    const binding = this.scope.define(name, this.localCount, meta);
+    this.localBindings.set(this.localCount, binding);
     return this.localCount;
   }
 
@@ -303,6 +490,60 @@ class VmCompiler {
     if (this.scope.parent) {
       this.scope = this.scope.parent;
     }
+  }
+
+  currentScopeCapturedLocalStart() {
+    if (!this.scope || !Array.isArray(this.scope.locals)) {
+      return null;
+    }
+    let start = null;
+    for (const binding of this.scope.locals) {
+      if (binding && binding.captured && binding.index) {
+        start = start === null ? binding.index : Math.min(start, binding.index);
+      }
+    }
+    return start;
+  }
+
+  closeCapturedLocalsFrom(start) {
+    if (start !== null && start !== undefined) {
+      this.emit("CLOSE_UPVALUES", start, 0);
+    }
+  }
+
+  closeCurrentScopeCapturedLocals() {
+    this.closeCapturedLocalsFrom(this.currentScopeCapturedLocalStart());
+  }
+
+  leaveScope() {
+    this.closeCurrentScopeCapturedLocals();
+    this.exitScope();
+  }
+
+  closeAllCapturedLocals() {
+    let start = null;
+    for (const binding of this.localBindings.values()) {
+      if (binding && binding.captured && binding.index) {
+        start = start === null ? binding.index : Math.min(start, binding.index);
+      }
+    }
+    this.closeCapturedLocalsFrom(start);
+  }
+
+  capturedLocalStartUntil(stopScope) {
+    let start = null;
+    let current = this.scope;
+    while (current && current !== stopScope) {
+      if (Array.isArray(current.locals)) {
+        for (const binding of current.locals) {
+          if (binding && binding.captured && binding.index) {
+            start = start === null ? binding.index : Math.min(start, binding.index);
+          }
+        }
+      }
+      current = current.parent;
+    }
+    return start;
   }
 
   emit(op, a = 0, b = 0) {
@@ -338,13 +579,14 @@ class VmCompiler {
 
   normalizePreboundLocal(entry) {
     if (typeof entry === "string") {
-      return { name: entry, init: entry, set: entry };
+      return { name: entry, init: entry, set: entry, meta: { prebound: true, external: true } };
     }
     if (entry && typeof entry.name === "string") {
       return {
         name: entry.name,
         init: entry.init !== undefined ? entry.init : entry.name,
         set: entry.set !== undefined ? entry.set : entry.name,
+        meta: entry.meta || { prebound: true },
       };
     }
     return null;
@@ -366,8 +608,12 @@ class VmCompiler {
     const previousHasVararg = this.functionHasVararg;
     this.functionHasVararg = Boolean(node && node.hasVararg);
     this.enterScope();
-    preboundLocals.forEach((entry) => {
-      this.defineLocal(entry.name, { prebound: true });
+    preboundLocals.forEach((entry, index) => {
+      this.defineLocal(entry.name, {
+        prebound: true,
+        upvalueIndex: entry.meta && entry.meta.upvalueIndex ? entry.meta.upvalueIndex : index + 1,
+        capture: entry.meta ? entry.meta.capture : null,
+      });
     });
     this.enterScope();
     params.forEach((param) => {
@@ -379,6 +625,7 @@ class VmCompiler {
     });
     const body = this.getFunctionBody(node);
     this.compileStatements(body);
+    this.closeAllCapturedLocals();
     this.emit("RETURN", 0, 0);
     this.emitter.patch();
     this.exitScope();
@@ -388,6 +635,11 @@ class VmCompiler {
       instructions: this.emitter.instructions,
       consts: this.consts,
       closures: this.closures,
+      upvalueDescriptors: preboundLocals
+        .filter((entry) => entry.meta && entry.meta.upvalueIndex)
+        .map((entry) => (entry.meta && entry.meta.capture
+          ? entry.meta.capture
+          : { type: "upvalue", index: entry.meta.upvalueIndex, name: entry.name })),
       localCount: this.localCount,
       paramCount: params.length,
       paramNames: params,
@@ -414,6 +666,7 @@ class VmCompiler {
     const previousHasVararg = this.functionHasVararg;
     this.functionHasVararg = false;
     this.compileStatements(body);
+    this.closeAllCapturedLocals();
     this.emit("RETURN", 0, 0);
     this.emitter.patch();
     this.exitScope();
@@ -422,6 +675,7 @@ class VmCompiler {
       instructions: this.emitter.instructions,
       consts: this.consts,
       closures: this.closures,
+      upvalueDescriptors: [],
       localCount: this.localCount,
       paramCount: locals.length,
       paramNames: locals,
@@ -532,7 +786,7 @@ class VmCompiler {
       case "DoStatement":
         this.enterScope();
         this.compileStatements(this.getBlockStatements(stmt.body));
-        this.exitScope();
+        this.leaveScope();
         return;
       case "BreakStatement":
         this.compileBreak();
@@ -728,6 +982,7 @@ class VmCompiler {
   compileReturnStatement(stmt) {
     const args = stmt.arguments || [];
     if (!args.length) {
+      this.closeAllCapturedLocals();
       this.emit("RETURN", 0, 0);
       return;
     }
@@ -738,6 +993,7 @@ class VmCompiler {
       }
       if (tailExpr.type === "VarargLiteral") {
         this.compileVarargPack(tailExpr);
+        this.closeAllCapturedLocals();
         this.emit("RETURN_VARARGS", args.length - 1, 0);
         return;
       }
@@ -745,11 +1001,13 @@ class VmCompiler {
         this.emitExpandedReturnCall(tailExpr, args.length - 1);
       } else {
         const argc = this.compileCallFrame(tailExpr);
+        this.closeAllCapturedLocals();
         this.emit("RETURN_CALL", argc, args.length - 1);
       }
       return;
     }
     args.forEach((expr) => this.compileValueExpression(expr, 1));
+    this.closeAllCapturedLocals();
     this.emit("RETURN", args.length, 0);
   }
 
@@ -761,7 +1019,7 @@ class VmCompiler {
       if (!clause.condition) {
         this.enterScope();
         this.compileStatements(clause.body);
-        this.exitScope();
+        this.leaveScope();
         this.emitJump("JMP", endLabel);
         break;
       }
@@ -774,7 +1032,7 @@ class VmCompiler {
       }
       this.enterScope();
       this.compileStatements(clause.body);
-      this.exitScope();
+      this.leaveScope();
       this.emitJump("JMP", endLabel);
       this.label(nextLabel);
       if (!directJump) {
@@ -813,7 +1071,8 @@ class VmCompiler {
   compileWhileStatement(stmt) {
     const startLabel = this.makeLabel("while_start");
     const endLabel = this.makeLabel("while_end");
-    this.loopStack.push({ breakLabel: endLabel, continueLabel: startLabel });
+    const closeStart = this.localCount + 1;
+    this.loopStack.push({ breakLabel: endLabel, continueLabel: startLabel, closeStart });
     this.label(startLabel);
     const directJump = this.tryCompileRegisterizedFalseJump(stmt.condition, endLabel);
     if (!directJump) {
@@ -823,7 +1082,7 @@ class VmCompiler {
     }
     this.enterScope();
     this.compileStatements(this.getBlockStatements(stmt.body));
-    this.exitScope();
+    this.leaveScope();
     this.emitJump("JMP", startLabel);
     this.label(endLabel);
     if (!directJump) {
@@ -836,18 +1095,22 @@ class VmCompiler {
     const startLabel = this.makeLabel("repeat_start");
     const endLabel = this.makeLabel("repeat_end");
     const condLabel = this.makeLabel("repeat_cond");
-    this.loopStack.push({ breakLabel: endLabel, continueLabel: condLabel });
     this.label(startLabel);
     this.enterScope();
+    const repeatScope = this.scope;
+    const closeStart = this.localCount + 1;
+    this.loopStack.push({ breakLabel: endLabel, continueLabel: condLabel, closeStart, repeatScope });
     this.compileStatements(this.getBlockStatements(stmt.body));
     this.label(condLabel);
-    const directJump = this.tryCompileRegisterizedFalseJump(stmt.condition, startLabel);
-    if (!directJump) {
-      this.compileExpression(stmt.condition);
-      this.emitJump("JMP_IF_FALSE", startLabel);
-      this.emit("POP", 0, 0);
-    }
-    this.exitScope();
+    const doneLabel = this.makeLabel("repeat_done");
+    this.compileExpression(stmt.condition);
+    this.closeCurrentScopeCapturedLocals();
+    this.emitJump("JMP_IF_TRUE", doneLabel);
+    this.emit("POP", 0, 0);
+    this.emitJump("JMP", startLabel);
+    this.label(doneLabel);
+    this.emit("POP", 0, 0);
+    this.leaveScope();
     this.label(endLabel);
     this.loopStack.pop();
   }
@@ -857,6 +1120,7 @@ class VmCompiler {
     const endLabel = this.makeLabel("for_end");
     const continueLabel = this.makeLabel("for_continue");
 
+    const closeStart = this.localCount + 1;
     this.enterScope();
     const varName = stmt.variable ? stmt.variable.name : null;
     const varIdx = varName ? this.defineLocal(varName, { loopVariable: true }) : this.nextTemp();
@@ -876,7 +1140,7 @@ class VmCompiler {
     }
     this.emit("SET_LOCAL", stepIdx, 0);
 
-    this.loopStack.push({ breakLabel: endLabel, continueLabel });
+    this.loopStack.push({ breakLabel: endLabel, continueLabel, closeStart });
 
     this.label(startLabel);
     this.emit("PUSH_LOCAL", stepIdx, 0);
@@ -900,12 +1164,13 @@ class VmCompiler {
     this.compileStatements(this.getBlockStatements(stmt.body));
 
     this.label(continueLabel);
+    this.closeCurrentScopeCapturedLocals();
     this.emit("ADD_REG_LOCAL", controlIdx, stepIdx);
     this.emitJump("JMP", startLabel);
     this.label(endLabel);
 
     this.loopStack.pop();
-    this.exitScope();
+    this.leaveScope();
   }
 
   compileForGeneric(stmt) {
@@ -913,6 +1178,7 @@ class VmCompiler {
     const endLabel = this.makeLabel("forg_end");
     const nilLabel = this.makeLabel("forg_nil");
 
+    const closeStart = this.localCount + 1;
     this.enterScope();
 
     const fnIdx = this.nextTemp();
@@ -964,7 +1230,7 @@ class VmCompiler {
       return this.nextTemp();
     });
 
-    this.loopStack.push({ breakLabel: endLabel, continueLabel: startLabel });
+    this.loopStack.push({ breakLabel: endLabel, continueLabel: startLabel, closeStart });
 
     this.label(startLabel);
     this.emit("PUSH_LOCAL", fnIdx, 0);
@@ -988,13 +1254,14 @@ class VmCompiler {
 
     this.compileStatements(this.getBlockStatements(stmt.body));
 
+    this.closeCurrentScopeCapturedLocals();
     this.emitJump("JMP", startLabel);
     this.label(nilLabel);
     this.emit("POP", 0, 0);
     this.label(endLabel);
 
     this.loopStack.pop();
-    this.exitScope();
+    this.leaveScope();
   }
 
   compileBreak() {
@@ -1002,6 +1269,7 @@ class VmCompiler {
     if (!loop) {
       raise("break outside loop");
     }
+    this.closeCapturedLocalsFrom(loop.closeStart);
     this.emitJump("JMP", loop.breakLabel);
   }
 
@@ -1009,6 +1277,11 @@ class VmCompiler {
     const loop = this.loopStack[this.loopStack.length - 1];
     if (!loop) {
       raise("continue outside loop");
+    }
+    if (loop.repeatScope) {
+      this.closeCapturedLocalsFrom(this.capturedLocalStartUntil(loop.repeatScope));
+    } else {
+      this.closeCapturedLocalsFrom(loop.closeStart);
     }
     this.emitJump("JMP", loop.continueLabel);
   }
@@ -1081,7 +1354,6 @@ class VmCompiler {
   }
 
   collectClosureCaptures(fnNode) {
-    const declared = collectDeclaredNamesInFunction(fnNode);
     const captures = [];
     const seen = new Set();
     collectFreeIdentifierOrderInFunction(fnNode).forEach((name) => {
@@ -1093,7 +1365,29 @@ class VmCompiler {
         return;
       }
       seen.add(name);
-      captures.push({ name, index: binding.index });
+      if (binding.meta && binding.meta.prebound && binding.meta.upvalueIndex) {
+        captures.push({
+          type: "upvalue",
+          captureType: "upvalue",
+          inStack: false,
+          name,
+          index: binding.meta.upvalueIndex || binding.index,
+          sourceIndex: binding.index,
+          source: binding.meta.capture || null,
+          debugName: name,
+        });
+        return;
+      }
+      binding.captured = true;
+      captures.push({
+        type: "local",
+        captureType: "ref",
+        inStack: true,
+        name,
+        index: binding.index,
+        sourceIndex: binding.index,
+        debugName: name,
+      });
     });
     return captures;
   }
@@ -1101,16 +1395,26 @@ class VmCompiler {
   compileFunctionClosure(fnNode) {
     const captures = this.collectClosureCaptures(fnNode);
     const child = new VmCompiler({ style: this.style, options: this.options });
-    const prebound = captures.map((capture, index) => ({
+    const upvalueDescriptors = captures.map((capture, index) => ({
+      ...capture,
+      childIndex: index + 1,
+    }));
+    const prebound = upvalueDescriptors.map((capture, index) => ({
       name: capture.name,
-      init: { cell: `__vm_captures[${index + 1}]` },
+      init: { cell: `__vm_upvalues[${index + 1}]` },
       set: null,
+      meta: {
+        prebound: true,
+        upvalueIndex: index + 1,
+        capture,
+      },
     }));
     const program = child.compileFunction(fnNode, prebound);
     const closureIndex = this.closures.length + 1;
     this.closures.push({
       program,
-      captures,
+      captures: upvalueDescriptors,
+      upvalueDescriptors,
     });
     this.emit("PUSH_CLOSURE", closureIndex, 0);
   }
@@ -1617,6 +1921,7 @@ class VmCompiler {
     this.emit("PUSH_LOCAL", fnIdx, 0);
     this.emit("PUSH_LOCAL", prefixIdx, 0);
     this.emit("PUSH_LOCAL", tailIdx, 0);
+    this.closeAllCapturedLocals();
     this.emit("RETURN_CALL_EXPAND", prefixCount, 0);
   }
 
@@ -1877,4 +2182,5 @@ class VmCompiler {
 
 module.exports = {
   VmCompiler,
+  collectFreeIdentifierOrderInFunction,
 };

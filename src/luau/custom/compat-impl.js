@@ -91,6 +91,28 @@ function convertType(node) {
   return out;
 }
 
+function splitGenericParameters(params) {
+  const generics = [];
+  const genericPacks = [];
+  if (Array.isArray(params)) {
+    for (const param of params) {
+      if (param && param.isPack) {
+        genericPacks.push(param);
+      } else {
+        generics.push(param);
+      }
+    }
+  }
+  return { generics, genericPacks };
+}
+
+function mergeGenericParameters(generics, genericPacks) {
+  return [
+    ...(Array.isArray(generics) ? generics : []),
+    ...(Array.isArray(genericPacks) ? genericPacks : []),
+  ];
+}
+
 function toOfficialNode(node) {
   if (Array.isArray(node)) {
     return node.map(toOfficialNode);
@@ -113,19 +135,32 @@ function toOfficialNode(node) {
       return out;
     case "ExportTypeStatement":
     case "TypeAliasStatement":
-      out.type = "StatTypeAlias";
-      out.generics = node.typeParameters || [];
-      out.genericPacks = null;
-      out.annotation = convertType(node.value);
-      out.exported = node.type === "ExportTypeStatement";
-      delete out.typeParameters;
-      delete out.value;
-      return out;
+      {
+        const split = splitGenericParameters(node.typeParameters);
+        out.type = "StatTypeAlias";
+        out.generics = split.generics;
+        out.genericPacks = split.genericPacks;
+        out.annotation = convertType(node.value);
+        out.exported = node.type === "ExportTypeStatement";
+        delete out.typeParameters;
+        delete out.value;
+        return out;
+      }
     case "FunctionDeclaration":
       out.type = node.isLocal ? "StatLocalFunction" : "StatFunction";
+      {
+        const split = splitGenericParameters(node.typeParameters);
+        out.generics = split.generics;
+        out.genericPacks = split.genericPacks;
+      }
       return out;
     case "DeclareFunctionStatement":
       out.type = "StatDeclareFunction";
+      {
+        const split = splitGenericParameters(node.typeParameters);
+        out.generics = split.generics;
+        out.genericPacks = split.genericPacks;
+      }
       return out;
     case "DeclareVariableStatement":
       out.type = "StatDeclareGlobal";
@@ -176,7 +211,7 @@ function toLegacyNode(node) {
       return out;
     case "StatTypeAlias":
       out.type = node.exported ? "ExportTypeStatement" : "TypeAliasStatement";
-      out.typeParameters = node.generics || [];
+      out.typeParameters = mergeGenericParameters(node.generics, node.genericPacks);
       out.value = toLegacyType(node.annotation);
       delete out.generics;
       delete out.genericPacks;
@@ -186,13 +221,22 @@ function toLegacyNode(node) {
     case "StatLocalFunction":
       out.type = "FunctionDeclaration";
       out.isLocal = true;
+      out.typeParameters = mergeGenericParameters(node.generics, node.genericPacks);
+      delete out.generics;
+      delete out.genericPacks;
       return out;
     case "StatFunction":
       out.type = "FunctionDeclaration";
       out.isLocal = false;
+      out.typeParameters = mergeGenericParameters(node.generics, node.genericPacks);
+      delete out.generics;
+      delete out.genericPacks;
       return out;
     case "StatDeclareFunction":
       out.type = "DeclareFunctionStatement";
+      out.typeParameters = mergeGenericParameters(node.generics, node.genericPacks);
+      delete out.generics;
+      delete out.genericPacks;
       return out;
     case "StatDeclareGlobal":
       out.type = "DeclareVariableStatement";
